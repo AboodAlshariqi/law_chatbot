@@ -1,0 +1,38 @@
+# Capital Legal Base — project configuration
+# Status: first-draft, several values are TODO pending decisions flagged throughout the notebooks.
+
+sources:
+  sjc:
+    base_url: "https://ahkam.sjc.bh"
+    needs_browser_session: true   # fingerprint check, plain requests get 403
+    needs_ocr: false
+  ccb:
+    base_url: "https://www.ccb.bh"
+    needs_browser_session: true
+    needs_ocr: false              # confirmed digital-native PDFs, not scanned
+  lloc:
+    base_url: "https://lloc.gov.bh"   # NOTE: no www. for /Legislation/Category
+    needs_browser_session: false
+    needs_ocr: false
+    request_delay_seconds: 1.2        # site is flaky under concurrent load, not a hard block
+
+embedding_model: "BAAI/bge-m3"   # TODO: confirm via comparison in 03a before trusting this default
+
+generation:
+  provider: "groq"                       # free tier, no confirmed budget for paid APIs yet
+  model: "llama-3.3-70b-versatile"
+  # TODO: not a jurisdiction-specific legal fine-tune, deliberately -- see 04b notes
+  temperature: 0.1
+  arabic_only: true   # pending re-confirmation, see open question #10
+
+vector_store:
+  backend: "chroma"
+  persist_dir: "../data/vector_store"
+
+retrieval:
+  hybrid: true            # semantic + BM25
+  k_per_method: 8
+  k_final: 6
+  include_ccb_always: true   # small corpus (22 docs), cheap to always include
+
+answer_mode_default: "comprehensive"   # pending client confirmation, open question #2
