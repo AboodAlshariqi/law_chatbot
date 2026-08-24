@@ -1,0 +1,10 @@
+streamlit
+langchain-huggingface
+langchain-chroma
+langchain-core
+langchain-community
+langchain-classic
+langchain-openai
+sentence-transformers
+transformers
+chromadb
