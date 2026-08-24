@@ -129,11 +129,48 @@ CITED_SOURCES_MARKER = "المصادر_المستخدمة:"
 QA_CHAIN_PROMPT = PromptTemplate.from_template(SYSTEM_TEMPLATE)
 
 
+# Google Drive folder holding the raw Chroma persist directory (chroma.sqlite3 + the HNSW index
+# subfolder) — not a zip, just the files as Chroma itself wrote them during the Colab embedding
+# run. Deployed environments (e.g. Streamlit Community Cloud) get a fresh git clone with no local
+# data/, so this must be fetched on first run rather than relying on it already being unzipped in
+# place. https://drive.google.com/drive/folders/1ovba37GozvlJOCHAuNchsoUIlXm8UMmW
+VECTORSTORE_DRIVE_FOLDER_ID = "1ovba37GozvlJOCHAuNchsoUIlXm8UMmW"
+
+
+def _download_vectorstore():
+    """Fetch the vectorstore from Drive into PERSIST_DIRECTORY. gdown.download_folder nests the
+    downloaded content under a subfolder named after the Drive folder in some versions and not in
+    others, so stage into a temp dir and locate the real content rather than assuming either."""
+    import shutil
+    import tempfile
+
+    import gdown
+
+    staging = Path(tempfile.mkdtemp(prefix="chroma_dl_"))
+    gdown.download_folder(id=VECTORSTORE_DRIVE_FOLDER_ID, output=str(staging), quiet=False, use_cookies=False)
+
+    # Find the directory that actually contains chroma.sqlite3 — either `staging` itself or one
+    # level down inside a Drive-folder-named subdirectory.
+    candidates = [staging] + [p for p in staging.iterdir() if p.is_dir()]
+    source = next((c for c in candidates if (c / "chroma.sqlite3").exists()), None)
+    if source is None:
+        shutil.rmtree(staging, ignore_errors=True)
+        raise RuntimeError("Downloaded vectorstore folder is missing chroma.sqlite3 — check the Drive folder contents.")
+
+    Path(PERSIST_DIRECTORY).parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(source), PERSIST_DIRECTORY)
+    shutil.rmtree(staging, ignore_errors=True)
+
+
 @st.cache_resource
 def load_vectorstore():
     if not Path(PERSIST_DIRECTORY).exists():
-        st.error(f"Vectorstore not found at {PERSIST_DIRECTORY} — unzip the Drive-backed vectorstore there first.")
-        st.stop()
+        with st.spinner("جارٍ تحميل قاعدة البيانات القانونية من التخزين السحابي — قد يستغرق ذلك بضع دقائق..."):
+            try:
+                _download_vectorstore()
+            except Exception as e:
+                st.error(f"تعذر تحميل قاعدة البيانات القانونية: {e}")
+                st.stop()
 
     embedding = HuggingFaceEmbeddings(model_name="BAAI/bge-m3", model_kwargs={"device": "cpu"})
     return Chroma(persist_directory=PERSIST_DIRECTORY, embedding_function=embedding)
