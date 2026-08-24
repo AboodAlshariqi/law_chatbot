@@ -1,0 +1,16 @@
+# Generated/processed data — large, regenerable, not meant for version control.
+# See law-chatbot-langchain/README.md "Rebuilding the vectorstore" for how to regenerate this.
+law-chatbot-langchain/data/
+law-chatbot-langchain/datafullseparated/
+
+# Real API keys — never commit. Only secrets.toml.example (the template) should be tracked.
+**/.streamlit/secrets.toml
+
+# Python
+__pycache__/
+*.pyc
+.ipynb_checkpoints/
+
+# OS/editor cruft
+.DS_Store
+Thumbs.db
