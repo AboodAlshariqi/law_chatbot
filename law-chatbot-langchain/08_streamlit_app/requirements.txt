@@ -8,3 +8,4 @@ langchain-openai
 sentence-transformers
 transformers
 chromadb
+gdown
