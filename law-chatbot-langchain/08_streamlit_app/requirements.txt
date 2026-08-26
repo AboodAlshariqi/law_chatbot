@@ -5,6 +5,7 @@ langchain-core
 langchain-community
 langchain-classic
 langchain-openai
+langchain-groq
 sentence-transformers
 transformers
 chromadb
