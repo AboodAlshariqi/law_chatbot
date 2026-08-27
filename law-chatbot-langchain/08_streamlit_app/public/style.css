@@ -1,0 +1,63 @@
+/* RTL fix for Arabic content in the Chainlit UI.
+   Root cause: <html lang="en"> has no dir attribute, so every message renders under the
+   browser's default left-to-right paragraph direction -- Arabic text ends up left-aligned,
+   list markers sit on the wrong side, and Latin citation codes (K3612, case numbers) flow
+   in a confusing order relative to the surrounding Arabic. direction: rtl on the actual
+   message content fixes alignment and bidi resolution; unicode-bidi: plaintext lets any
+   genuinely Latin-only lines (stray English text) resolve their own direction instead of
+   being forced RTL. */
+
+.prose,
+.prose p,
+.prose li,
+.prose h1,
+.prose h2,
+.prose h3,
+.prose h4,
+.prose blockquote,
+.side-text,
+.side-text p,
+.side-text li,
+.side-text h1,
+.side-text h2,
+.side-text h3,
+.side-text h4,
+.side-text blockquote {
+  direction: rtl;
+  text-align: right;
+  unicode-bidi: plaintext;
+}
+
+/* Tailwind's typography plugin pads list markers on the left by default (LTR assumption) --
+   flip to the right so markers sit on the correct side of RTL text. */
+.prose ul,
+.prose ol,
+.side-text ul,
+.side-text ol {
+  padding-right: 1.5em;
+  padding-left: 0;
+}
+
+/* Tables (rare in these answers, but Groq-style detailed responses do produce them) --
+   right-align cell content so columns read naturally alongside RTL paragraphs. */
+.prose th,
+.prose td,
+.side-text th,
+.side-text td {
+  text-align: right;
+}
+
+/* The Readme ("اقرأني") dialog and the Settings dialog share the same shadcn DialogHeader,
+   which hard-codes text-align:left on sm+ screens (Tailwind's LTR default) -- flip it so the
+   dialog title sits on the correct side for an all-Arabic app. */
+[role="dialog"] h2,
+[role="dialog"] div:has(> h2) {
+  text-align: right;
+}
+
+/* The composer textarea itself, so typing an Arabic question feels natural too. */
+#chat-input,
+textarea[placeholder] {
+  direction: rtl;
+  text-align: right;
+}

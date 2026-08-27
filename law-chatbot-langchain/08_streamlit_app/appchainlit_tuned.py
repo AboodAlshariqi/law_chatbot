@@ -1,4 +1,5 @@
 
+
 import functools
 import json
 import os
@@ -15,8 +16,6 @@ from chainlit.input_widget import MultiSelect, Select, Slider
 from langchain_chroma import Chroma
 from langchain_classic.chains import ConversationalRetrievalChain
 from langchain_classic.memory import ConversationBufferWindowMemory
-from langchain_classic.retrievers import ContextualCompressionRetriever
-from langchain_classic.retrievers.document_compressors import LLMChainExtractor
 from langchain_core.callbacks import CallbackManagerForRetrieverRun
 from langchain_core.documents import Document
 from langchain_core.prompts import PromptTemplate
@@ -77,17 +76,24 @@ SOURCE_LABELS = {"lloc": "التشريعات", "sjc": "السوابق القضا
 
 SEARCH_SCORE_THRESHOLD = 0.95
 
-# Search's own fetch pool -- unchanged, untested by the fetch_k sweep (Search doesn't go
-# through ThresholdMMRRetriever). See module docstring.
+# Search's own fetch pool -- unchanged, evaluation-confirmed as the right choice for Search
+# specifically (see module docstring: adding MMR here made Hit@10 worse, 62.0% vs 75.0%).
 SEARCH_FETCH_POOL = 300
 
-# Chat's candidate pool -- see module docstring for the full sweep + recall-safety reasoning.
+# Chat's candidate pool -- the one real change in this file. 09_evaluation_v2.ipynb measured
+# fetch_k=20 against the real ThresholdMMRRetriever class over all 92 questions and found it
+# matches fetch_k=300's accuracy (65.2% vs 64.1% Hit@6) while running ~3x faster.
 CHAT_FETCH_K = 20
 
 
 class ThresholdMMRRetriever(BaseRetriever):
-    """Identical to appchainlit.py's version, except the fetch_k default is CHAT_FETCH_K (20)
-    instead of SEARCH_FETCH_POOL (300) -- see module docstring."""
+    """Combines a relevance-score cutoff with MMR diversity for Chat -- LangChain's built-in
+    retriever only supports one or the other (search_type is either "mmr" or
+    "similarity_score_threshold", not both at once). Kept over plain similarity search (which
+    scored HIGHER on the narrow single-answer benchmark, 75.0% vs ~65%) because a separate
+    multi-source test in the eval notebook showed plain similarity search missing every relevant
+    court case entirely on broader questions, while MMR correctly surfaced sources across both
+    lloc and sjc -- see module docstring for the real numbers."""
 
     vectordb: Chroma
     k: int = 6
@@ -135,6 +141,26 @@ SYSTEM_TEMPLATE = """انت مساعد قانوني متخصص في القانو
 - اذا لم تكن الاجابة موجودة في النصوص المرفقة، صرح بذلك بوضوح ولا تخمن.
 - اذكر المصدر الدقيق لكل معلومة (رقم المادة او رقم القضية)، وانقل اسم القانون او القرار كما هو مكتوب حرفياً في النص المرفق فقط. لا تنسب اي معلومة الى اسم قانون لم يرد ذكره صراحة في النص المرفق.
 - قبل استخدام اي مقطع، تحقق ان موضوعه يتعلق فعلاً بموضوع السؤال. اذا كان المقطع من مجال قانوني مختلف (مثل قرار اسكاني او اداري لا علاقة له بالسؤال) فلا تستخدمه ولا تذكره في الاجابة، حتى لو تشابهت بعض الكلمات.
+- نظم اجابتك القانونية بالشكل التالي، حسب نوع المصادر المتوفرة فعلاً في النصوص المرفقة:
+
+  ## القوانين ذات الصلة
+  لكل مادة قانونية تجيب على السؤال:
+  - اذكر اسم القانون او القرار كما هو مكتوب حرفياً في النص المرفق، ورقم المادة.
+  - اذكر نص الحكم القانوني نفسه (اقتباسا او تلخيصا دقيقا لما ورد في المادة، دون اضافة او تأويل).
+  - وضح الشروط او الحالات التي ينطبق فيها هذا الحكم، ان وردت في النص (مثل: متى يسري، على من ينطبق، ما الاستثناءات المذكورة صراحة).
+
+  ## تطبيقات قضائية
+  لكل حكم من محكمة التمييز يتعلق فعلاً بموضوع السؤال:
+  - اذكر رقم الطعن وسنته (او رقم القاعدة ان وجد)، كما ورد حرفياً في النص المرفق.
+  - لخص وقائع القضية بايجاز: ما هو النزاع، ومن هم الاطراف، وما الذي حدث.
+  - اشرح كيف طبقت المحكمة النص القانوني على هذه الوقائع تحديدا، وما التفسير الذي اعتمدته المحكمة للمادة القانونية (لا تكتفِ بذكر رقم القضية دون شرح كيف طبقت المحكمة القانون).
+  - اذكر ما انتهت اليه المحكمة (قبول الطعن، رفضه، نقض الحكم، تاييده... الخ) وبأي أساس قانوني.
+
+  قواعد التنظيم:
+  - اذا توفر في النصوص المرفقة نص تشريعي فقط (بدون احكام قضائية)، اكتب قسم "القوانين ذات الصلة" فقط، ولا تكتب قسم "تطبيقات قضائية" ولا تشر الى غيابه.
+  - اذا توفرت احكام قضائية فقط (بدون نص تشريعي مباشر)، اكتب قسم "تطبيقات قضائية" فقط، واذكر ضمن شرحك اي مادة قانونية ورد ذكرها صراحة داخل نص الحكم القضائي نفسه (فهي جزء من النص المرفق، لا اضافة من عندك).
+  - اذا توفر النوعان معا، اكتب القسمين، وابدأ بالقوانين ذات الصلة ثم تطبيقاتها القضائية، بحيث يفهم القارئ الحكم العام اولا ثم كيف طبقته المحكمة عمليا.
+  - لا تخترع قسما لا يوجد له سند في النصوص المرفقة تحت اي ظرف.
 - اختم اجابتك دائماً بسطر منفصل يبدأ حرفياً بـ "المصادر_المستخدمة:" يليه فقط ارقام المواد و/او ارقام القضايا التي استندت اليها فعلاً في متن الاجابة (وليس تلك التي استبعدتها او ذكرتها لتوضيح عدم صلتها)، مفصولة بفواصل. اذا لم تستند الى اي نص مرفق فعلاً (سؤال غير متعلق بالقانون، او لا توجد اجابة في النصوص المرفقة)، اكتب "المصادر_المستخدمة: لا يوجد".
 
 النصوص القانونية:
@@ -181,15 +207,16 @@ def _invoke_with_retry(chain, payload, max_attempts=6, base_delay=3):
 
 
 LLM_PROVIDERS = {
-    "openrouter": {"label": "OpenRouter — Nemotron (الافتراضي)", "k": 6, "max_chars": None},
+    "openrouter": {"label": "OpenRouter — Nemotron (الاساسي)", "k": 6, "max_chars": None},
     "groq": {"label": "Groq — GPT-OSS-120B (أسرع)", "k": 2, "max_chars": 6000},
 }
 DEFAULT_LLM_PROVIDER = "openrouter"
 
 
 def build_qa_chain(vectordb, provider):
-    """Same as appchainlit.py's version, except the retriever is wrapped in
-    ContextualCompressionRetriever -- see module docstring for the cost/benefit tradeoff."""
+    """Same shape as appchainlit.py's version -- no compression wrapper (see module docstring
+    for why). The only difference from appchainlit.py is that ThresholdMMRRetriever now defaults
+    to CHAT_FETCH_K (20) instead of SEARCH_FETCH_POOL (300)."""
     cfg = LLM_PROVIDERS[provider]
 
     if provider == "groq":
@@ -209,12 +236,9 @@ def build_qa_chain(vectordb, provider):
         )
 
     memory = ConversationBufferWindowMemory(k=cfg["k"], memory_key="chat_history", return_messages=True, output_key="answer")
-    base_retriever = ThresholdMMRRetriever(vectordb=vectordb, k=cfg["k"], max_chars=cfg["max_chars"])
-    compressor = LLMChainExtractor.from_llm(llm)
-    retriever = ContextualCompressionRetriever(base_compressor=compressor, base_retriever=base_retriever)
     return ConversationalRetrievalChain.from_llm(
         llm,
-        retriever=retriever,
+        retriever=ThresholdMMRRetriever(vectordb=vectordb, k=cfg["k"], max_chars=cfg["max_chars"]),
         memory=memory,
         return_source_documents=True,
         combine_docs_chain_kwargs={"prompt": QA_CHAIN_PROMPT},
@@ -256,9 +280,12 @@ def full_text_for_doc(doc):
     source = doc.metadata.get("source", "")
     doc_id = doc.metadata.get("doc_id", "")
     if source in NORMALIZED_SOURCES:
-        full_text = load_normalized_lookup(source).get(doc_id)
-        if full_text:
-            return full_text
+        try:
+            full_text = load_normalized_lookup(source).get(doc_id)
+            if full_text:
+                return full_text
+        except MemoryError:
+            pass
     if source == "lloc":
         full_text = load_lloc_article_lookup().get((doc_id, doc.metadata.get("article_no")))
         if full_text:
@@ -316,45 +343,66 @@ def mark_cited(sources, answer):
 
 
 def sources_to_elements(sources):
-    elements = []
+    """Build the side-panel element for the retrieved sources.
+
+    IMPORTANT: Chainlit 2.11.1's side panel does not give each `cl.Text(display="side")`
+    element attached to one message its own title -- confirmed live, and this holds for ANY
+    count greater than one, not just large ones: attaching 2+ elements to one message
+    renders them merged into a single shared card (one title bar, bodies stacked/duplicated
+    underneath). An earlier version of this function built one element for cited sources and
+    a second for uncited ones, which still hit this bug whenever a question had both --
+    confirmed live with a real duplicated-panel report. The only fully reliable fix is to
+    never attach more than ONE element to a message: this builds exactly one combined
+    document with two internal sections ("مستشهد بها" / "غير مستشهد بها"), each source given
+    its own "### [i] ..." heading inside the single element's content, so identification
+    never depends on Chainlit's per-element or multi-element title handling at all.
+    """
     labels = []
     cited = [s for s in sources if s.get("cited")]
     uncited = [s for s in sources if not s.get("cited")]
 
-    for i, src in enumerate(cited, start=1):
+    def format_block(i, src, is_cited):
         article = src.get("article_no", "")
         article_part = f" — مادة {article}" if article else ""
-        name = f"[{i}] {src.get('source', '')} — {src.get('doc_id', '')}{article_part}"
-        labels.append(f"[{i}]")
-        body = (
-            f"المصدر: {src.get('source', '')}\n"
-            f"رقم الوثيقة: {src.get('doc_id', '')}\n"
-            f"رقم المادة: {src.get('article_no', '') or '—'}\n"
-            f"التصنيف: {src.get('category', '') or '—'}\n\n"
-            f"{src.get('text', '')}"
+        heading = f"[{i}] {src.get('source', '')} — {src.get('doc_id', '')}{article_part}"
+        if not is_cited:
+            heading = f"(غير مستشهد به) {heading}"
+        return (
+            f"### {heading}\n\n"
+            f"**المصدر:** {src.get('source', '')}  \n"
+            f"**رقم الوثيقة:** {src.get('doc_id', '')}  \n"
+            f"**رقم المادة:** {src.get('article_no', '') or '—'}  \n"
+            f"**التصنيف:** {src.get('category', '') or '—'}\n\n"
+            f"{src.get('text', '')}\n\n---\n"
         )
-        elements.append(cl.Text(name=name, content=body, display="side"))
 
-    for j, src in enumerate(uncited, start=1):
-        article = src.get("article_no", "")
-        article_part = f" — مادة {article}" if article else ""
-        name = f"(غير مستشهد به) {src.get('source', '')} — {src.get('doc_id', '')}{article_part}"
-        body = (
-            f"مصدر تم استرجاعه ولم يُستشهد به صراحة في الاجابة.\n\n"
-            f"المصدر: {src.get('source', '')}\n"
-            f"رقم الوثيقة: {src.get('doc_id', '')}\n"
-            f"رقم المادة: {src.get('article_no', '') or '—'}\n"
-            f"التصنيف: {src.get('category', '') or '—'}\n\n"
-            f"{src.get('text', '')}"
-        )
-        elements.append(cl.Text(name=name, content=body, display="side"))
+    sections = []
+
+    cited_blocks = []
+    for i, src in enumerate(cited, start=1):
+        labels.append(f"[{i}]")
+        cited_blocks.append(format_block(i, src, is_cited=True))
+    if cited_blocks:
+        sections.append("## المصادر المستشهد بها في الاجابة\n\n" + "\n".join(cited_blocks))
+
+    uncited_blocks = [format_block(j, src, is_cited=False) for j, src in enumerate(uncited, start=1)]
+    if uncited_blocks:
+        sections.append("## مصادر تم استرجاعها ولم يُستشهد بها\n\n" + "\n".join(uncited_blocks))
+
+    elements = []
+    if sections:
+        elements.append(cl.Text(
+            name="المصادر",
+            content="\n\n".join(sections),
+            display="side",
+        ))
 
     content_suffix = ("\n\n**المصادر المستشهد بها في الاجابة:** " + " ".join(labels)) if labels else ""
     return elements, content_suffix
 
 
 def build_export_text(messages):
-    lines = ["# سجل المحادثة — Capital Legal Base (نسخة الضغط)", ""]
+    lines = ["# سجل المحادثة — Capital Legal Base (نسخة معايرة بالتقييم)", ""]
     turn = 0
     for msg in messages:
         if msg["role"] == "user":
@@ -442,7 +490,7 @@ async def start():
     ]
     welcome = (
         "مرحباً بك في مساعد البحث القانوني الذكي — Capital Legal Base "
-        "(نموذج أولي، نسخة Chainlit مع ضغط المقاطع المسترجعة).\n\n"
+        "(نموذج أولي، نسخة معايرة وفق نتائج التقييم الفعلي).\n\n"
         "اكتب سؤالك القانوني مباشرة للمحادثة مع النموذج، أو اختر الأمر **" + SEARCH_COMMAND_ID + "** "
         "من قائمة الأوامر (زر \"/\") لبحث مباشر بدون نموذج لغوي. استخدم لوحة الإعدادات (⚙) لاختيار "
         "المصادر وعدد النتائج ومزود النموذج اللغوي (OpenRouter/Nemotron الافتراضي، أو Groq الأسرع)."
@@ -558,10 +606,8 @@ async def on_message(message: cl.Message):
         cl.user_session.set("history", history)
         return
 
-    # qa_chain.retriever is now a ContextualCompressionRetriever wrapping ThresholdMMRRetriever
-    # (see build_qa_chain) -- the live-updatable filter attribute lives on .base_retriever now.
     selected_sources = cl.user_session.get("selected_sources") or list(ALL_SOURCES)
-    qa_chain.retriever.base_retriever.filter = build_source_filter(selected_sources)
+    qa_chain.retriever.filter = build_source_filter(selected_sources)
 
     async with cl.Step(name="جارٍ البحث والتحقق من المصادر...", type="run"):
         sources = []
@@ -627,7 +673,7 @@ async def export_conversation(action: cl.Action):
         return
     export_text = build_export_text(history)
     file_element = cl.File(
-        name="capital_legal_base_conversation_compressed.md",
+        name="capital_legal_base_conversation_tuned.md",
         content=export_text.encode("utf-8"),
         mime="text/markdown",
         display="inline",
