@@ -1,0 +1,238 @@
+/* RTL fix for Arabic content in the Chainlit UI.
+   Root cause: <html lang="en"> has no dir attribute, so every message renders under the
+   browser's default left-to-right paragraph direction -- Arabic text ends up left-aligned,
+   list markers sit on the wrong side, and Latin citation codes (K3612, case numbers) flow
+   in a confusing order relative to the surrounding Arabic. direction: rtl on the actual
+   message content fixes alignment and bidi resolution; unicode-bidi: plaintext lets any
+   genuinely Latin-only lines (stray English text) resolve their own direction instead of
+   being forced RTL. */
+
+.prose,
+.prose p,
+.prose li,
+.prose h1,
+.prose h2,
+.prose h3,
+.prose h4,
+.prose blockquote,
+.side-text,
+.side-text p,
+.side-text li,
+.side-text h1,
+.side-text h2,
+.side-text h3,
+.side-text h4,
+.side-text blockquote {
+  direction: rtl;
+  text-align: right;
+  unicode-bidi: plaintext;
+}
+
+/* Tailwind's typography plugin pads list markers on the left by default (LTR assumption) --
+   flip to the right so markers sit on the correct side of RTL text. */
+.prose ul,
+.prose ol,
+.side-text ul,
+.side-text ol {
+  padding-right: 1.5em;
+  padding-left: 0;
+}
+
+/* Tables (rare in these answers, but Groq-style detailed responses do produce them) --
+   right-align cell content so columns read naturally alongside RTL paragraphs. */
+.prose th,
+.prose td,
+.side-text th,
+.side-text td {
+  text-align: right;
+}
+
+/* The Readme ("اقرأني") dialog and the Settings dialog share the same shadcn DialogHeader,
+   which hard-codes text-align:left on sm+ screens (Tailwind's LTR default) -- flip it so the
+   dialog title sits on the correct side for an all-Arabic app. */
+[role="dialog"] h2,
+[role="dialog"] div:has(> h2) {
+  text-align: right;
+}
+
+/* The composer textarea itself, so typing an Arabic question feels natural too. */
+#chat-input,
+textarea[placeholder] {
+  direction: rtl;
+  text-align: right;
+}
+
+/* ---------------------------------------------------------------------------
+   Accent colour: Chainlit's stock --primary is 340 92% 52% -- rgb(245,20,95),
+   a hot rose. It drives the send button, focus rings and every primary control,
+   and it is the one colour in the app that reads as consumer-product rather
+   than legal-reference. Retuned to the navy already used for the message
+   bubbles (#1E3A5F = hsl(214 52% 25%)) so the whole UI shares one accent.
+
+   Overriding the token rather than the individual elements means anything
+   Chainlit paints with --primary follows automatically, including controls
+   that do not exist yet.
+   --------------------------------------------------------------------------- */
+
+   NOTE ON SPECIFICITY -- this is why the selectors below look redundant:
+   Chainlit serves its own bundle (/assets/index-*.css) AFTER this file, so a
+   plain `:root` here loses to its `:root` on source order alone, silently.
+   `html:root` scores (0,1,1) against their (0,1,0) and wins regardless of
+   order. Do not "simplify" these back to :root -- the rules stop applying. */
+
+html:root {
+  --primary: 214 52% 25%;
+  --primary-foreground: 0 0% 100%;
+  /* The focus ring sits ON surfaces rather than under text, so it is lifted a
+     few steps for visibility without becoming a second accent. */
+  --ring: 214 45% 38%;
+}
+
+/* Near-black page: the light-mode navy would sink into the background, so the
+   dark theme gets a lighter step of the same hue -- the same relationship the
+   bubble tokens above already use. */
+html.dark:root {
+  --primary: 213 58% 54%;
+  --primary-foreground: 0 0% 100%;
+  --ring: 213 58% 60%;
+}
+
+/* Composer: a defined edge instead of a flat filled block. In light mode the
+   stock composer is a grey fill with no border, which lets it blur into the
+   page on white; a hairline border and a very soft shadow give it the same
+   "input surface" reading the message bubbles have. Dark mode keeps its fill
+   (the border alone would be invisible there) and only gains the edge. */
+html:root .bg-accent.rounded-3xl:has(#chat-input) {
+  border: 1px solid hsl(214 20% 88%);
+  box-shadow: 0 1px 3px hsl(214 30% 20% / 0.06);
+}
+
+html.dark:root .bg-accent.rounded-3xl:has(#chat-input) {
+  border-color: hsl(214 12% 30%);
+  box-shadow: none;
+}
+
+/* ---------------------------------------------------------------------------
+   Message bubbles (navy).
+
+   The client could not tell their own message from the assistant's. Two causes:
+   the user bubble used Tailwind's neutral `bg-accent` (rgb(66,66,66) in dark
+   mode), and the assistant message had no container at all -- transparent text
+   on the page background. Colour alone would not have fixed it, so the
+   assistant now gets a real surface as well.
+
+   Palette: user #E8EDF5 / bot #1C2733 / accent #1E3A5F, with dark-mode variants
+   that keep the same light-vs-dark relationship on a near-black page.
+   --------------------------------------------------------------------------- */
+
+:root {
+  --bubble-user-bg: #e8edf5;
+  --bubble-user-fg: #12202e;
+  --bubble-bot-bg: #1c2733;
+  --bubble-bot-fg: #f2f5f9;
+  --bubble-bot-border: #1c2733;
+  --bubble-accent: #1e3a5f;
+  /* Links live INSIDE the bot bubble, which is dark in both themes -- so this is
+     a light tint even in light mode. Using --bubble-accent here put navy on
+     near-navy at a 1.32 contrast ratio: every source link was invisible. */
+  --bubble-bot-link: #8fb8e8;
+  /* The command label ("بحث", "سؤال جديد"...) rendered inside the user's own bubble.
+     Chainlit hardcodes this to `text-[#08f]` (#0088FF), which measures 2.9:1 against
+     the #E8EDF5 bubble on the client's white background -- below the 4.5:1 minimum and
+     the one colour in the transcript that visibly did not belong. Navy keeps it reading
+     as a distinct label rather than body text, at ~10:1. */
+  --bubble-command: #1e3a5f;
+  /* Blockquote accent. Follows --bubble-bot-link, not --bubble-accent: quotes render
+     inside the bot bubble, which is dark in both themes, so navy would disappear. */
+  --bubble-quote-bar: #8fb8e8;
+  --bubble-quote-bg: rgba(255, 255, 255, 0.045);
+}
+
+/* Dark mode needs its own values, not a tint of the light ones: the page is
+   rgb(33,33,33), so the light-mode bot colour (#1C2733) sits at a 1.01 contrast
+   ratio against it -- a bubble you cannot see. Both surfaces are therefore
+   lifted above the page, and separated from each other by saturation (navy vs
+   slate) as well as luminance. */
+html.dark {
+  --bubble-user-bg: #35577f;
+  --bubble-user-fg: #eef4ff;
+  --bubble-bot-bg: #2a3340;
+  --bubble-bot-fg: #e6eaf0;
+  --bubble-bot-border: #3d4a5c;
+  --bubble-accent: #7fb0e8;
+  --bubble-bot-link: #9cc6f2;
+  /* The dark-mode user bubble is navy (#35577F), so the light-mode navy label would be
+     invisible on it -- this needs its own light tint, same as --bubble-bot-link does. */
+  --bubble-command: #bcd6f5;
+  --bubble-quote-bar: #9cc6f2;
+  --bubble-quote-bg: rgba(255, 255, 255, 0.06);
+}
+
+/* Command label inside the user bubble. Chainlit's own `text-[#08f]` is a single-class
+   selector (0,1,0); this two-part selector scores (0,2,0) and wins without !important. */
+[data-step-type="user_message"] .command-span {
+  color: var(--bubble-command);
+}
+
+/* User bubble -- overrides Tailwind's .bg-accent by specificity, no !important. */
+[data-step-type="user_message"] .bg-accent {
+  background-color: var(--bubble-user-bg);
+  color: var(--bubble-user-fg);
+}
+
+/* Assistant bubble -- the container that did not previously exist. */
+[data-step-type="assistant_message"] .message-content {
+  background-color: var(--bubble-bot-bg);
+  color: var(--bubble-bot-fg);
+  border: 1px solid var(--bubble-bot-border);
+  border-radius: 1.25rem;
+  padding: 0.875rem 1.25rem;
+}
+
+/* Long legal answers are mostly headings and lists; inherit the bubble's colour
+   rather than the theme's, or Tailwind's prose defaults render them near-black
+   on the dark bubble. */
+[data-step-type="assistant_message"] .message-content .prose,
+[data-step-type="assistant_message"] .message-content .prose p,
+[data-step-type="assistant_message"] .message-content .prose li,
+[data-step-type="assistant_message"] .message-content .prose h1,
+[data-step-type="assistant_message"] .message-content .prose h2,
+[data-step-type="assistant_message"] .message-content .prose h3,
+[data-step-type="assistant_message"] .message-content .prose h4,
+[data-step-type="assistant_message"] .message-content .prose strong,
+[data-step-type="assistant_message"] .message-content .prose td,
+[data-step-type="assistant_message"] .message-content .prose th {
+  color: inherit;
+}
+
+/* Citation links (article numbers, lloc.gov.bh source links) need to stay
+   legible against the bubble, not the page. */
+[data-step-type="assistant_message"] .message-content a {
+  color: var(--bubble-bot-link);
+  text-decoration-color: var(--bubble-bot-link);
+}
+
+/* Markdown blockquotes -- the `> "نص المادة..."` form Fanar uses for article text.
+   Chainlit styles them with nothing but `margin:0` (Tailwind Preflight), so without this
+   they render as an unstyled paragraph with no indent, no bar and collapsed spacing.
+   `.prose blockquote` scores (0,1,1) against Preflight's (0,0,1), so no !important.
+
+   The bar is on the RIGHT deliberately: Arabic text starts from that edge, and a
+   `border-left` -- what an LTR rule gives -- would sit at the far end of the line, away
+   from the text it marks. Text colour is left inherited rather than muted: here the quote
+   is the verbatim article, the most important thing on screen, not an aside. */
+.prose blockquote,
+.side-text blockquote {
+  border-right: 3px solid var(--bubble-quote-bar);
+  border-left: 0;
+  padding: 0.4rem 0.85rem 0.4rem 0;
+  margin: 0.7rem 0;
+  background: var(--bubble-quote-bg);
+  border-radius: 2px;
+}
+
+/* Preflight zeroes paragraph margins, so a multi-paragraph quote would run together. */
+.prose blockquote p,
+.side-text blockquote p {
+  margin: 0;
+}

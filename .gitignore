@@ -1,16 +1,30 @@
-# Generated/processed data — large, regenerable, not meant for version control.
-# See law-chatbot-langchain/README.md "Rebuilding the vectorstore" for how to regenerate this.
-law-chatbot-langchain/data/
-law-chatbot-langchain/datafullseparated/
-
-# Real API keys — never commit. Only secrets.toml.example (the template) should be tracked.
+# --- secrets -------------------------------------------------------------------------
+# The app reads keys from here, falling back to environment variables. Never commit it:
+# git keeps history forever, so a key pushed once stays recoverable after it is deleted.
 **/.streamlit/secrets.toml
+.env
 
-# Python
+# --- data ----------------------------------------------------------------------------
+# ~5 GB, far past what GitHub accepts. data/README.md explains how to obtain and verify it.
+data/*
+!data/README.md
+
+# --- session logs --------------------------------------------------------------------
+# Every question and answer verbatim -- useful for evaluation, not for publishing.
+**/logs/
+*.jsonl
+
+# --- python ---------------------------------------------------------------------------
 __pycache__/
-*.pyc
+*.py[cod]
 .ipynb_checkpoints/
+.venv/
+venv/
 
-# OS/editor cruft
+# --- chainlit runtime ------------------------------------------------------------------
+.files/
+.chainlit/.langchain.db
+
+# --- os ---------------------------------------------------------------------------------
 .DS_Store
 Thumbs.db

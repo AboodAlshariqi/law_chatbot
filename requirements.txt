@@ -1,0 +1,19 @@
+# Pinned to what is actually running locally, so a rebuild cannot pull a breaking release.
+# On ARM (Oracle Ampere A1) DELETE the --extra-index-url line: that index publishes no
+# aarch64 wheels, and plain PyPI torch is CPU-only on ARM Linux anyway.
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.13.0
+chainlit==2.11.1
+chromadb==1.5.9
+langchain==1.3.15
+langchain-chroma==1.1.0
+langchain-classic==1.0.8
+langchain-community==0.4.2
+langchain-core==1.6.0
+langchain-groq==1.1.3
+langchain-huggingface==1.2.2
+langchain-openai==1.6.0
+sentence-transformers==6.0.0
+transformers==5.15.1
+numpy==2.5.1
+gdown==6.1.0
