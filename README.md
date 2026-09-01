@@ -161,6 +161,9 @@ A research aid that shows its work — not a substitute for the official text or
 
 ---
 
+## App Demo
+- `Demo.mp4`: https://drive.google.com/file/d/1LCjebHTD7QCWEIUqosYCGDVnzgbR9YTM/view?usp=sharing
+
 ## License
 
 MIT — see [LICENSE](LICENSE). The legal texts themselves are Bahraini government publications
