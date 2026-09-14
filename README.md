@@ -157,10 +157,6 @@ Stated plainly, because they bound what the system can do:
   search draws 300–2,000. A relevant judgment can reach the search view and not the chat.
 - **Constitutional Court coverage is small** — 162 passages — and its scanned text carries OCR
   damage.
-- **Nothing in the source data links a judgment to the law it applied.** Search infers it by
-  scanning judgment text for citations — an approximation, not ground truth.
-- **The system constrains sources, not reasoning.** A model can still misread the passages it
-  was given.
 - **Some areas are not codified at all.** Inheritance shares are governed by Islamic
   jurisprudence under the Constitution, so no article exists to retrieve.
 
