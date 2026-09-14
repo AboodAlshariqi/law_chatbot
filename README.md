@@ -109,8 +109,8 @@ FANAR_API_KEY = "..."
 cd src
 chainlit run app.py --port 8000 -w
 ```
-
-البحث المباشر works without any key; only the chat needs a model.
+ 
+Search feeature works without any key; only the chat needs a model.
 
 ### Models
 
