@@ -5,7 +5,7 @@
 .env
 
 # --- data ----------------------------------------------------------------------------
-# ~5 GB, far past what GitHub accepts. data/README.md explains how to obtain and verify it.
+# ~2.1 GB, far past what GitHub accepts. data/README.md explains how to obtain and verify it.
 data/*
 !data/README.md
 

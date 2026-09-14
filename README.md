@@ -82,8 +82,9 @@ Measured on `chroma_v3` over 14 questions with hand-verified answer keys
 | MRR | **0.723** |
 | retrieved both source types | **14 / 14** |
 | median retrieval time | 1.2 s |
-| median answer time | ~20 s (Fanar) |
-| cost | ~$0.005 per question |
+
+All three models run on free tiers, so there is no per-question cost. Answer latency is not
+measured here — it is dominated by the remote model rather than by anything in this repo.
 
 `Hit@8` is the ceiling on the whole system: the model only ever sees 8 passages, so an
 article ranked ninth cannot be cited however good the answer is.
@@ -131,7 +132,7 @@ notebooks/   01a-01c  scraping, one per source
              05-07    retrieval, QA and chat experiments
              08       evaluation on chroma_v3
 src/         app.py and the Chainlit interface
-data/        instructions only — the corpus is ~5 GB
+data/        instructions only — the corpus is ~2.1 GB
 ```
 
 ---

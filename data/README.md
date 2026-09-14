@@ -1,6 +1,6 @@
 # Data
 
-The corpus is ~5 GB and is not in this repository. This file explains what is needed, where
+The corpus is ~2.1 GB and is not in this repository. This file explains what is needed, where
 to get it, and how to confirm it arrived intact.
 
 ## What the app needs to run
@@ -70,8 +70,17 @@ raw scrape           notebooks/01a · 01b · 01c
   -> chroma_v3             notebooks/04
 ```
 
-**One gap worth stating plainly:** `notebooks/04` reads `document_splits_v3.json.gz`, while
-`notebooks/03` in this repository produces `document_splits_v2.json`. The v3 file was made by
-a later run of the same splitting notebook with adjusted parameters, and only its output was
-kept -- the parameters themselves were not recorded. The difference is substantial:
-`chroma_v3` holds 49,782 passages against the earlier store's 25,738.
+**Two gaps worth stating plainly.**
+
+`notebooks/04` reads `document_splits_v3.json.gz`, while `notebooks/03` in this repository
+produces `document_splits_v2.json`. The v3 file came from a later run of the same splitting
+notebook with adjusted parameters, and only its output was kept -- the parameters themselves
+were not recorded.
+
+`document_splits_v3.json.gz` then holds 47,383 chunks, while the released `chroma_v3` holds
+49,782. The documents are the same in both -- 3,075 laws, 9,009 cases, 93 rulings, 12,177 in
+all -- but the released store splits long judgments into several chunks each, where the
+splits file keeps one chunk per case. That pass is not in any notebook here either.
+
+So the pipeline below rebuilds a working store, but not the one the app ships with. Download
+the released store above if you need the numbers in `notebooks/08` to reproduce.

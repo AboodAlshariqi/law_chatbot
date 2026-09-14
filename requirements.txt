@@ -17,3 +17,10 @@ sentence-transformers==6.0.0
 transformers==5.15.1
 numpy==2.5.1
 gdown==6.1.0
+
+# Imported lazily by src/app.py when a document is uploaded: PDF, DOCX and
+# plain-text reading respectively. Missing these leaves the chat working and the
+# attachment feature raising ImportError on the first file.
+pymupdf==1.26.3
+defusedxml==0.7.1
+chardet==5.2.0
