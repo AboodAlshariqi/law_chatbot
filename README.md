@@ -120,6 +120,12 @@ chainlit run app.py --port 8000 -w
 | **Nemotron 550B** | 262k | most detailed, slowest (~56 s), free tier is shared |
 | **MiniMax M3** | 1M | large context; free tier shares upstream capacity |
 
+The context windows come from each provider's own documentation, and the response times are
+from ordinary use rather than a benchmark. Neither is measured anywhere in this repository —
+the only timing established here is median retrieval time, in `notebooks/08_evaluation.ipynb`,
+and that covers retrieval alone. Answer time is dominated by the remote model and varies with
+how busy it is.
+
 ---
 
 ## Repository
