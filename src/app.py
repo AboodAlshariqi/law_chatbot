@@ -75,17 +75,18 @@ NORMALIZED_SOURCES = {
 ALL_SOURCES = {"lloc", "sjc", "ccb"}
 SOURCE_LABELS = {"lloc": "التشريعات", "sjc": "السوابق القضائية", "ccb": "المحكمة الدستورية"}
 
-# --- Session logging -------------------------------------------------------------------
-# The client reported wrong answers during a live demo and none of it was recoverable
-# afterwards -- there was no record of what was asked, what was retrieved, or what was
-# answered. Every turn is now appended to a JSONL file so a session can be reconstructed
-# and debugged later instead of relying on memory.
+# Session logging.
+#
+# Every turn is appended to a JSONL file: the question, which passages came back, and what
+# the model answered. When someone reports a wrong answer this is the only way to tell
+# whether retrieval fetched the wrong law or the model misread the right one.
 LOG_DIR = APP_DIR / "logs"
 LOG_PATH = LOG_DIR / "sessions.jsonl"
 
 
 def log_turn(kind, **fields):
-    """Append one turn to the session log. Never raises -- logging must not break the app."""
+    """Append one turn to the session log. Errors are swallowed, because a failure to
+    log should never break a conversation."""
     try:
         LOG_DIR.mkdir(parents=True, exist_ok=True)
         rec = {
@@ -101,7 +102,7 @@ def log_turn(kind, **fields):
 
 
 def sources_for_log(sources):
-    """Compact source record: enough to diagnose a bad answer without storing full texts."""
+    """Summarise which passages were used. Records the identifiers, not the text."""
     return [
         {
             "source": s.get("source"),
@@ -113,48 +114,59 @@ def sources_for_log(sources):
         for s in sources
     ]
 
+# Both are distances, not similarities: lower means closer, and anything above the cutoff
+# is dropped before it reaches the reader. Search is the stricter of the two because its
+# results are shown raw; browsing is looser because the reader is scanning rather than
+# asking a question.
 SEARCH_SCORE_THRESHOLD = 0.95
-
-# --- Change 3: Search gets its own, slightly looser threshold. ---
 SEARCH_SCORE_THRESHOLD_BROWSE = 1.05
 
-# Chat's candidate pool. Raised from 20 to 300: with only 20 candidates, a well-worded
-# question on a criminal-law topic fills the entire pool with Penal Code articles before a
-# single judgment appears, so the source guarantee below has nothing to promote. 300 gives
-
+# The old whole-corpus pool size. Chat no longer uses it -- it queries each source
+# separately now -- but it is still the default for ThresholdMMRRetriever.fetch_k.
 CHAT_FETCH_K = 300
 
 
+# Chat retrieval in the order it happens: 30 candidates from each selected source, then
+# the merged pool reduced to 8 passages. Querying per source is what stops the biggest
+# source taking every slot. Legislation outnumbers case law roughly three to one, so a
+# single blended query on a criminal-law question comes back as articles and no judgments.
 CHAT_FETCH_K_PER_SOURCE = 30
 CHAT_RESULT_K = 8
-# Its OWN threshold: SEARCH_SCORE_THRESHOLD is shared with Search in this file, so reusing
-# it here would move Search's cutoff as a side effect. Looser than Search's because the
-# per-source split already prevents one type from crowding the pool.
+
+# Chat keeps its own cutoff rather than borrowing Search's, which would move both at once.
+# It can afford to be looser: splitting the query per source already prevents one type of
+# document crowding out the other, and the model filters what it is handed.
 CHAT_SCORE_THRESHOLD = 1.05
 
-# A law's own header, e.g. "مرسوم بقانون رقم (19) لسنة 2001". Used two ways: to read a
-# retrieved law's (number, year), and to find the same pattern cited inside a judgment --
-# which is the only way to tell WHICH law a judgment applied. Verified against the corpus:
-# sjc records carry no linking metadata at all (title/categories/article_no/section_heading
-# are empty for all 11,339 chunks), and 33.8% of them cite a decree number in their text.
+# Matches a law's own header, e.g. "مرسوم بقانون رقم (19) لسنة 2001".
+#
+# Two jobs. It reads the (number, year) off a retrieved law, and it finds that same
+# reference quoted inside a judgment. The second one matters because nothing in the source
+# data records which law a judgment applied: sjc records carry no linking metadata at all,
+# so a citation in the text is the only signal there is. About a third of judgments have
+# one.
 LAW_CITATION = re.compile(r"(?:مرسوم\s+بقانون|قانون)\s+رقم\s*\(?\s*(\d+)\s*\)?\s*لسنة\s*(\d{4})")
 
-# Search's base fetch pool -- kept as the floor.
+# Search casts a far wider net than chat: it fetches twenty times the number of results
+# asked for, floored at 300 and capped at 2,000 so a large request cannot stall the page.
+# This is why a judgment can surface in Search and never appear in Chat.
 SEARCH_FETCH_POOL = 300
-
-# --- Change 2: Search's fetch pool now scales with the user's requested k_value. ---
-SEARCH_FETCH_MULTIPLIER = 20   # fetch up to 20x the requested result count
-SEARCH_FETCH_POOL_MAX = 2000   # hard cap so worst-case latency stays bounded
+SEARCH_FETCH_MULTIPLIER = 20
+SEARCH_FETCH_POOL_MAX = 2000
 
 
 class ThresholdMMRRetriever(BaseRetriever):
-    """Combines a relevance-score cutoff with MMR diversity for Chat -- LangChain's built-in
-    retriever only supports one or the other (search_type is either "mmr" or
-    "similarity_score_threshold", not both at once). Kept over plain similarity search (which
-    scored HIGHER on the narrow single-answer benchmark, 75.0% vs ~65%) because a separate
-    multi-source test in the eval notebook showed plain similarity search missing every relevant
-    court case entirely on broader questions, while MMR correctly surfaced sources across both
-    lloc and sjc -- see appchainlit_tuned.py's module docstring for the real numbers."""
+    """Applies a relevance cutoff, then diversifies whatever survives it.
+
+    LangChain's own retriever does one or the other: search_type is either "mmr" or
+    "similarity_score_threshold". Chat needs both. The cutoff keeps irrelevant passages
+    out, and MMR stops the result set filling up with near-identical wordings of a single
+    article.
+
+    Plain similarity search scores slightly higher on single-answer benchmarks, but it
+    returned no case law at all on broader questions, which is the failure that matters
+    most here.
+    """
 
     vectordb: Chroma
     k: int = 6
@@ -165,13 +177,12 @@ class ThresholdMMRRetriever(BaseRetriever):
     max_chars: Optional[int] = None
 
     def _guarantee_both(self, idxs, kept):
-        """If MMR chose only one source type but the other IS available, give it one slot.
+        """Give the missing document type a slot when MMR picked only one kind.
 
-        Deliberately displaces only the LAST (weakest) of MMR's picks, so the top of the
-        result set is untouched and the answer keeps its best-matching document. Returns
-        idxs unchanged when both types are already present, when only one type was
-        selected, or when the other type genuinely has nothing above the threshold --
-        nothing is invented.
+        Displaces the weakest of MMR's choices, so the best-matching passage is never the
+        one dropped. Leaves the selection alone when both types are already present, or
+        when the missing type genuinely has nothing above the cutoff. Nothing is invented
+        to fill the gap.
         """
         wanted = self._wanted_sources()
         if not ("lloc" in wanted and ({"sjc", "ccb"} & wanted)):
@@ -185,9 +196,9 @@ class ThresholdMMRRetriever(BaseRetriever):
         if (have_leg and have_jud) or not idxs:
             return idxs
 
-        need_leg = not have_leg          # which type is missing from the answer
+        need_leg = not have_leg          # the type missing from the answer
         chosen = set(idxs)
-        for cand in range(len(kept)):    # kept is in relevance order -- take the best one
+        for cand in range(len(kept)):    # kept is ordered by relevance, so the first match is the best
             if cand not in chosen and is_leg(cand) == need_leg:
                 return idxs[:-1] + [cand]
         return idxs
@@ -203,8 +214,8 @@ class ThresholdMMRRetriever(BaseRetriever):
         return [(d, m, e) for d, m, dist, e in zip(docs, metas, dists, embs) if dist <= self.score_threshold]
 
     def _wanted_sources(self):
-        """Which sources the user selected, read back out of the Chroma filter that
-        build_source_filter() produced. None means 'no filter', i.e. everything."""
+        """The sources the user selected, read back out of the Chroma filter that
+        build_source_filter() produced. No filter means everything."""
         if not self.filter:
             return set(ALL_SOURCES)
         src = self.filter.get("source")
@@ -213,7 +224,7 @@ class ThresholdMMRRetriever(BaseRetriever):
         return {src} if src else set(ALL_SOURCES)
 
     def _selected_source_names(self):
-        """The source names to query separately, read back out of the Chroma filter."""
+        """The sources to query one at a time, read back out of the Chroma filter."""
         if not self.filter:
             return sorted(ALL_SOURCES)
         src = self.filter.get("source")
@@ -222,7 +233,7 @@ class ThresholdMMRRetriever(BaseRetriever):
         return [src] if src else sorted(ALL_SOURCES)
 
     def _query_source(self, query_vec, source):
-        """CHAT_FETCH_K_PER_SOURCE candidates from ONE source, threshold applied here."""
+        """Candidates from a single source, with the distance cutoff applied here."""
         raw = self.vectordb._collection.query(
             query_embeddings=[query_vec],
             n_results=CHAT_FETCH_K_PER_SOURCE,
@@ -245,28 +256,27 @@ class ThresholdMMRRetriever(BaseRetriever):
         if not candidates:
             return []
 
-        # Deduplicate before MMR. article_no is part of the key so two different articles
-        # of the same law stay distinct rather than collapsing into one.
+        # Deduplicate before MMR runs. article_no is part of the key, so two different
+        # articles of the same law stay separate instead of collapsing into one.
         seen, unique = set(), []
         for d, m, e, dist in candidates:
             key = (m.get("source", ""), m.get("doc_id", ""), m.get("article_no", ""), d)
             if key not in seen:
                 seen.add(key)
                 unique.append((d, m, e, dist))
-        unique.sort(key=lambda x: x[3])          # relevance order across all sources
+        unique.sort(key=lambda x: x[3])          # relevance order across every source
 
         kept = [(d, m, e) for d, m, e, _ in unique]
 
-        # --- source guarantee (Chat) -------------------------------------------------
-        # Same failure Search had: a well-worded question about a criminal-law topic
-        # returns six Penal Code articles and not one judgment, even though the client
-        # asked for both sources. MMR diversifies in EMBEDDING space, which is not the
-        # same as source-type diversity -- six near-identical articles of one law are
-        # "diverse enough" for MMR while carrying no case law at all.
+        # Make sure both kinds of source are represented.
         #
-        # Two distinct causes, handled separately:
-        #   a) the type never entered the candidate pool  -> targeted top-up query
-        #   b) it is in the pool but MMR did not pick it   -> displace one slot, below
+        # MMR diversifies in embedding space, which is not the same as diversifying by
+        # source. Six near-identical articles of one law look diverse enough to MMR while
+        # carrying no case law at all, and a criminal-law question hits that every time.
+        #
+        # Two causes, handled separately:
+        #   the type never reached the pool      -> targeted query for it, just below
+        #   it is in the pool but MMR skipped it -> give it a slot, in _guarantee_both
         wanted = self._wanted_sources()
         want_legislation = "lloc" in wanted
         want_judgments = bool({"sjc", "ccb"} & wanted)
@@ -290,19 +300,19 @@ class ThresholdMMRRetriever(BaseRetriever):
         return results
 
 
-# Article numbers are stored in metadata but are absent from the chunk text itself: of 600
-# random legislation chunks, 2 mention their own article number in the prefix. A model
-# quoting the passage therefore cannot cite it, and guesses -- which silently drops the
-# source from قائمة المصادر even when the legal answer is exactly right.
+# Article numbers are in the metadata but usually missing from the chunk text itself: of
+# 600 random legislation chunks, 2 state their own article number in the opening. A model
+# quoting the passage therefore has nothing to cite and guesses, which quietly drops the
+# source from the panel even when the legal answer is right.
 _HAS_ARTICLE = re.compile(r"ماد[\u0629\u0647]\s*\(?\s*(\d+)")
 
 
 def _add_article_header(docs):
-    """Prefix each legislation chunk with its own article number, in the app's own format.
+    """Prefix each legislation chunk with its own article number.
 
-    Written as "مادة (N)" -- the same shape mark_cited() looks for -- so a model copying the
-    heading produces a citation that matches. Judgments are left alone: their appeal number
-    is already in their prefix, which is why they cite reliably today.
+    Written as "مادة (N)", the shape mark_cited() looks for, so a model copying the heading
+    produces a citation that matches. Judgments are left alone: their appeal number is
+    already in the text, which is why they cite reliably.
     """
     for d in docs:
         if d.metadata.get("source") != "lloc":
@@ -310,8 +320,8 @@ def _add_article_header(docs):
         article = str(d.metadata.get("article_no") or "").strip()
         if not article:
             continue
-        # Skip when the opening already states this article, so laws that do carry the
-        # heading in their text do not get a duplicate one.
+        # Skip when the opening already states the article, so laws that do carry their
+        # own heading do not end up with two.
         head = d.page_content[:400]
         if any(m.group(1) == article for m in _HAS_ARTICLE.finditer(head)):
             continue
@@ -397,26 +407,25 @@ SYSTEM_TEMPLATE = SYSTEM_TEMPLATE.replace(
 
 QA_CHAIN_PROMPT = PromptTemplate.from_template(SYSTEM_TEMPLATE)
 
-# ---------------------------------------------------------------------------
-# Nemotron Super 120B writes English words into Arabic answers. SYSTEM_TEMPLATE above is
-# NOT modified -- the 550B obeys it and needs none of this.
+# Nemotron Super 120B slips English words into Arabic answers. SYSTEM_TEMPLATE above is
+# left alone, because the 550B follows it and needs none of this.
 #
-# Three observed failures, all from this model on this app:
-#   1. "material 113" instead of "مادة (113)". This is the damaging one: mark_cited()
-#      looks for مادة followed by the article number, so the correct article -- retrieved
-#      at rank 1 -- was recorded as uncited and vanished from قائمة المصادر.
-#   2. "namely" and "merits of the claim" dropped mid-sentence into an Arabic answer.
-#   3. "We need to respond in Arabic formal (Fus..." -- internal reasoning printed as the
-#      answer, on a prompt that had explicitly asked for Arabic only (617 Latin chars).
+# Three failures seen from this model on this app:
+#   1. "material 113" in place of "مادة (113)". This is the damaging one: mark_cited()
+#      looks for مادة followed by the article number, so an article retrieved at rank 1
+#      was recorded as uncited and disappeared from قائمة المصادر.
+#   2. "namely" and "merits of the claim" dropped into the middle of an Arabic sentence.
+#   3. "We need to respond in Arabic formal (Fus..." printed as the answer: internal
+#      reasoning, on a prompt that had asked for Arabic only.
 #
-# Built by WRAPPING SYSTEM_TEMPLATE rather than rewriting it: the legal formatting rules
-# already work on this model, only the language discipline fails. The rules go first (read
-# before the documents) and a one-line reminder goes last, immediately before the answer
-# marker -- the final thing the model reads before generating.
+# The fix wraps SYSTEM_TEMPLATE rather than rewriting it. The legal formatting rules
+# already work on this model; only the language discipline fails. The extra rules go
+# first, where they are read before the documents, and a one-line reminder goes last,
+# immediately before the answer marker, which is the final thing the model reads.
 #
-# Note rule 3: appeal numbers genuinely contain Latin letters in the corpus
-# ("192 M 1999 K 34"), so a blanket "no Latin characters" rule would break every judgment
-# citation. The rule bans foreign WORDS, not the Latin script.
+# Rule 3 exists because appeal numbers really do contain Latin letters in this corpus
+# ("192 M 1999 K 34"). A blanket ban on the Latin script would break every judgment
+# citation, so the rule bans foreign words instead.
 _NEMOTRON_AR_RULES = """تنبيه لغوي ملزم — اقرأه قبل كل شيء:
 
 ١. اكتب الاجابة كاملة بالعربية الفصحى. ممنوع منعاً باتاً استعمال اي كلمة اجنبية داخل النص.
@@ -445,21 +454,17 @@ NEMOTRON_SUPER_PROMPT = PromptTemplate.from_template(NEMOTRON_SUPER_TEMPLATE)
 
 
 def prompt_for(provider):
-    """The chat prompt for one model. Falls back to QA_CHAIN_PROMPT, so any provider
-    without its own entry behaves exactly as before."""
+    """The chat prompt for one model, falling back to QA_CHAIN_PROMPT when it has none."""
     return (LLM_PROVIDERS.get(provider) or {}).get("prompt") or QA_CHAIN_PROMPT
 
-# ---------------------------------------------------------------------------
-# Attachment prompts.
+# Prompts for the two attachment features.
 #
-# SYSTEM_TEMPLATE above is deliberately left untouched -- these are separate
-# templates for the two attachment features, so the behaviour of an ordinary
-# question is unchanged.
+# SYSTEM_TEMPLATE above is left untouched, so an ordinary question behaves exactly as it
+# did before these existed.
 #
-# REVIEW keeps the "المصادر_المستخدمة:" contract because it retrieves from the
-# corpus and its sources feed the same panel. DOCQA has no retrieved sources at
-# all, so it has no such line and no sources panel.
-# ---------------------------------------------------------------------------
+# REVIEW keeps the "المصادر_المستخدمة:" contract because it retrieves from the corpus and
+# its sources feed the same panel. DOCQA retrieves nothing, so it has no such line and no
+# panel.
 
 REVIEW_TEMPLATE = """انت مساعد قانوني متخصص في القانون البحريني. امامك مستند مرفق من المستخدم، بالاضافة الى نصوص قانونية بحرينية مسترجعة من قاعدة البيانات. مهمتك مراجعة المستند في ضوء هذه النصوص.
 
@@ -539,22 +544,23 @@ def get_vectorstore():
 
 
 def _condense_question(chain, question, chat_history):
-    """Rewrite a follow-up into a standalone question, using the chain's own question
-    generator so behaviour matches ConversationalRetrievalChain exactly. Runs WITHOUT
-    streaming -- only the final answer should appear in the chat."""
+    """Rewrite a follow-up into a question that stands on its own.
+
+    Uses the chain's own question generator, so the behaviour matches
+    ConversationalRetrievalChain. Runs without streaming: only the final answer belongs in
+    the chat.
+    """
     try:
         return chain.question_generator.run(question=question, chat_history=chat_history)
     except Exception:
         return question
 
 
-# Signatures of a transient upstream failure, matched against str(exception).lower().
+# Signs of a temporary upstream failure, matched against the lowercased exception text.
 #
-# "provider returned error" was added after the free Nemotron endpoint spent an evening
-# rejecting ~7 of every 8 requests under load. It returns the SAME overload as either 404
-# or 502 depending on how the request was routed, so matching on the status code alone
-# caught only some of them and the 404s fell straight through to the user as an error.
-# Matching the message text covers both.
+# "provider returned error" is here because the free Nemotron endpoint reports the same
+# overload as a 404 or a 502 depending on how the request was routed. Matching the status
+# code alone caught only the 502s, and the 404s reached the user as hard errors.
 OVERLOAD_MARKERS = ("502", "overloaded", "provider returned error")
 STREAM_MAX_ATTEMPTS = 5
 
@@ -570,22 +576,14 @@ def _invoke_with_retry(chain, payload, max_attempts=6, base_delay=3):
             time.sleep(min(base_delay * (2 ** (attempt - 1)), 30))
 
 
-# Every model lives in exactly one self-contained entry -- its own model string, endpoint,
-# secret name, memory window and context budget. Nothing is shared between entries and
-# nothing is inferred from the provider key, so adding or removing a model cannot change
-# how any other model behaves. The two original entries below are byte-for-byte the same
-# configuration they had before this table existed; only the surrounding plumbing moved.
+# One self-contained entry per model: its model id, endpoint, secret name, memory window
+# and context budget. Nothing is shared between entries and nothing is inferred from the
+# key, so adding or removing a model cannot change how another one behaves.
 #
-# "kind" selects the client class: "groq" -> ChatGroq, "openai" -> ChatOpenAI against any
-# OpenAI-compatible endpoint (which is what OpenRouter and most of the rest expose).
-#
-# NOTE ON THE ARABIC-NATIVE MODELS at the bottom: they are NOT on OpenRouter -- searched
-# all 396 models in its live catalogue, and allam/fanar/jais/silma return zero hits. Each
-# needs its own endpoint, so their base_url is left as None on purpose. Selecting one
-# before you fill that in gives a clear Arabic message telling you what is missing; it
-# does not raise and does not affect any other model.
+# "kind" picks the client class. "groq" builds a ChatGroq; "openai" builds a ChatOpenAI
+# against any OpenAI-compatible endpoint, which is what OpenRouter and most others expose.
 LLM_PROVIDERS = {
-    # --- the two originals, unchanged ------------------------------------------------
+    # Nemotron: the largest of the three, and the default.
     "openrouter": {
         "label": "OpenRouter — Nemotron (الاساسي)",
         "kind": "openai",
@@ -595,19 +593,16 @@ LLM_PROVIDERS = {
         "k": 6, "max_chars": 16000,
         "stream_timeout": 300,
     },
-    # --- additional FREE model, via the existing OpenRouter key ----------------------
-    # MiniMax M3. Added after GLM and Gemma were removed for upstream_provider_shared_pool
-    # 429s, and it is worth stating why this one is not the same bet: GLM failed on one or
-    # two tries, repeatedly, over hours; MiniMax answered on every check made today,
-    # including one taken while nemotron_super was returning 502 from NVIDIA. It also won
-    # the earlier free-model comparison on this corpus. Same shared-pool exposure in
-    # principle -- it is still an OpenRouter :free endpoint -- so treat it as a second
-    # option, not as the one to demo on.
+    # MiniMax M3, reached through the same OpenRouter key.
     #
-    # Verified free across every pricing field (prompt, completion, request) against
-    # OpenRouter's live catalogue, and the window is 1,048,576 tokens -- four times
-    # Nemotron Super's. max_chars = None because truncation is meaningless at that size:
-    # the longest chunk in the corpus is 29,269 chars, so k=6 uncapped cannot approach it.
+    # Added after GLM and Gemma were dropped for shared-pool 429s. It answered on every
+    # check made while Nemotron was returning 502s, and it won the earlier free-model
+    # comparison on this corpus. It is still a :free endpoint and carries the same exposure
+    # to a saturated upstream, so treat it as the second option rather than the one to
+    # present on.
+    #
+    # Its window is 1,048,576 tokens, so max_chars is None. The longest chunk in the corpus
+    # is 29,269 characters; six of those cannot come close to filling it.
     "minimax": {
         "label": "MiniMax M3 — مجاني",
         "kind": "openai",
@@ -617,7 +612,7 @@ LLM_PROVIDERS = {
         "k": 6, "max_chars": None,
         "stream_timeout": 300,
     },
-    # --- DISABLED (kept for reference; strip the "# " to restore) ---
+    # Disabled, kept so it can be switched back on by stripping the "# " prefix.
     # "nemotron_nano": {
         # "label": "Nemotron Nano 30B — مجاني (الأسرع)",
         # "kind": "openai",
@@ -627,56 +622,41 @@ LLM_PROVIDERS = {
         # "k": 6, "max_chars": None,
         # "stream_timeout": 300,
     # },
-    # --- Arabic-native model: endpoint must be filled in before use ------------------
-    # Fanar is the only one of the Arabic-native models kept here, because it is the only
-    # one that needs neither a GPU nor a billing account: QCRI grants API keys free on
-    # request at fanar.qa, and the API is OpenAI-compatible, so filling in base_url and
-    # the secret below is the whole integration.
+
+    # Fanar, from QCRI: the Arabic-native option, and the one this app runs on by default.
     #
-    # ALLaM (watsonx/Azure) and Jais (Azure) were removed -- both are hosted but require a
-    # paid cloud account -- and SILMA was removed as weights-only, needing a GPU this
-    # machine does not have.
+    # It is here rather than ALLaM, Jais or SILMA because it is the only one needing
+    # neither a GPU nor a paid cloud account. QCRI issues API keys on request and the
+    # endpoint speaks the OpenAI protocol, so the entry below is the whole integration.
     #
-    # base_url is deliberately left blank rather than guessed: a wrong one fails at request
-    # time with an opaque network error instead of a message telling you what to fix.
-    # Endpoint and model id read from QCRI's own OpenAPI document at api.fanar.qa, not
-    # guessed: paths are /v1/chat/completions etc., so base_url carries the /v1. NOTE the
-    # API's model id is NOT the HuggingFace repo name -- the card reads
-    # "Fanar-2-27B-Instruct" but the API expects "Fanar-C-2-27B". Auth is a standard
-    # Bearer token, which ChatOpenAI already sends. Rate limit: 50 requests/minute.
-    # CONTEXT BUDGET -- why max_chars is far tighter here than for any other model.
-    # Fanar's window is 16,000 tokens TOTAL; k=6 with uncapped documents sent 36,664 and
-    # the API rejected the request outright with 413 too_large.
+    # Two details that are easy to get wrong. The API's model id is not the HuggingFace
+    # repo name: the model card says "Fanar-2-27B-Instruct", the API expects
+    # "Fanar-C-2-27B". And base_url has to carry the /v1, because the paths underneath it
+    # are /chat/completions and the rest. The rate limit is 50 requests a minute.
     #
-    # The budget below is MEASURED, not estimated: Fanar's own /v1/tokens endpoint was
-    # called with this app's real system prompt and four real corpus passages.
-    #   SYSTEM_TEMPLATE   3,543 chars = 1,190 tokens   (2.98 chars/token)
-    #   corpus passages                                 2.89-3.00 chars/token
-    # Arabic legal text costs ~2.89 chars/token here -- roughly 20% more tokens per
-    # character than the 3.50 measured for the OpenAI-family tokeniser on this corpus.
+    # The context budget is why max_chars is so much tighter here than anywhere else.
+    # Fanar's window is 16,000 tokens for everything at once -- prompt, passages and
+    # answer. Arabic legal text in this corpus costs about 2.89 characters per token,
+    # roughly 20% more tokens per character than English, which leaves:
     #
-    #   window                          16,000
-    #   - system prompt                  1,190
-    #   - answer headroom                2,500   (median answer is ~600 tokens)
-    #   - slack                            200
-    #   = documents                     12,110 tokens = ~34,900 chars at 2.89
-    #   / k=6                           ~5,800 chars each
+    #     window                  16,000
+    #     - system prompt          1,190
+    #     - room for the answer    2,500
+    #     - slack                    200
+    #     = passages              12,110 tokens, about 34,900 characters
+    #     over 8 passages          ~4,300 characters each
     #
-    # k stays at 6 to match the Hit@6 retrieval benchmark -- the correct article often
-    # sits at rank 3-6, so a smaller k costs recall directly. Truncating at 5,800 loses
-    # every law reference in roughly 5% of judgments (measured), which is the unavoidable
-    # cost of a 16k window; it is preferable to dropping a whole document.
+    # Go past that and the API rejects the entire request with 413. Truncating at 4,300
+    # loses a law reference at the tail of roughly 5% of judgments, which is the price of a
+    # 16k window; dropping a whole passage would cost more.
     "fanar": {
         "label": "Fanar (QCRI) — عربي",
         "kind": "openai",
         "model": "Fanar-C-2-27B",
         "base_url": "https://api.fanar.qa/v1",
         "secret": "FANAR_API_KEY",
-        # max_chars re-derived for k=8. Fanar's window is 16,000 tokens TOTAL and this
-        # corpus costs ~2.89 chars/token (measured via Fanar's own /v1/tokens endpoint), so
-        # 8 x 5,800 = 46,400 chars is ~16,000 tokens of context BEFORE the 1,190-token
-        # system prompt -- rejected with 413 too_large. 8 x 4,300 = 34,400 chars ~= 11,900
-        # tokens, which fits with the same headroom the previous k=6 budget had.
+        # 4,300 characters across 8 passages is about 11,900 tokens, which fits the
+        # budget set out above.
         "k": 6, "retrieval_k": 8, "max_chars": 4300,
     },
 }
@@ -707,17 +687,15 @@ def _build_llm(cfg):
         temperature=0,
         api_key=api_key,
         base_url=cfg["base_url"],
-        # Streaming does not make generation faster, but it removes the dead wait:
-        # the lawyer sees the answer forming within ~2s instead of staring at a
-        # spinner for the full response time. No accuracy cost.
+            # Streaming does not make the answer arrive any sooner, but the reader watches
+            # it form after a couple of seconds instead of staring at a spinner.
         streaming=True,
     )
-    # How long to wait for the FIRST streamed token before giving up. langchain-openai
-    # defaults to 120s, which is too tight for a queued free endpoint: the logged
-    # turns include successful answers taking up to 220.7s, so a request that would
-    # have worked was being killed at 120 and surfaced to the user as an error.
-    # Raising this does NOT make anything faster -- it stops a slow-but-alive request
-    # being aborted. The cost is that a genuinely dead connection hangs longer.
+    # How long to wait for the first streamed token. The library default of 120 seconds is
+    # too tight for a queued free endpoint: the logs hold successful answers that took 220
+    # seconds, and those were being killed and shown to the user as errors. Raising it
+    # speeds nothing up -- it stops a slow answer being thrown away, at the cost of a
+    # genuinely dead connection taking longer to give up on.
     if cfg.get("stream_timeout"):
         kwargs["stream_chunk_timeout"] = cfg["stream_timeout"]
     return ChatOpenAI(**kwargs)
@@ -734,8 +712,8 @@ def build_qa_chain(vectordb, provider):
                                         max_chars=cfg["max_chars"]),
         memory=memory,
         return_source_documents=True,
-        # Kept in sync with the streaming path above, though chat does not go through
-        # chain.invoke() -- this matters only for any code path that does.
+            # Chat streams the model directly and never calls chain.invoke(), so this
+            # prompt only matters to code paths that do.
         combine_docs_chain_kwargs={"prompt": prompt_for(provider)},
     )
 
@@ -844,17 +822,16 @@ _INDEX_REF = re.compile(r"\[(\d{1,2})\]")
 def mark_cited(sources, answer):
     scope, in_citation_line = _citation_scope(answer)
 
-    # Preferred path: the model cited by index, as the prompt asks. One integer identifies
-    # one chunk exactly, so nothing has to be re-derived from prose.
+    # The path the prompt asks for. The model writes [1], [3], and those integers identify
+    # the passages exactly, so nothing has to be recovered from the prose.
     ids = {int(n) for n in _INDEX_REF.findall(scope) if 0 < int(n) <= len(sources)}
     if ids:
         for src in sources:
             src["cited"] = src.get("source_id") in ids
         return sources
 
-    # Fallback: no [n] anywhere. A model that ignored the instruction should still get its
-    # citations recognised rather than losing every source, so the article/appeal-number
-    # matching below runs exactly as before.
+    # Nothing was cited by index. Rather than show no sources at all, fall back to reading
+    # article and appeal numbers out of the text.
     for src in sources:
         if src.get("source") == "lloc":
             article = src.get("article_no")
@@ -875,12 +852,11 @@ def mark_cited(sources, answer):
             if not cited:
                 for occ in re.finditer(re.escape(appeal_no), scope):
                     window = scope[max(0, occ.start() - 15):occ.start() + 40]
-                    # Inside a real citation line الطعن is not required. Models copy the
-                    # court's own reference format out of the judgment text -- e.g.
-                    # "الطعن رقم 2/00001/2023/35" for a doc_id stored as "1 M 2023 K 00" -- and the
-                    # 15-character lookbehind then misses الطعن by ONE character, dropping a
-                    # citation the model made correctly and explicitly. In prose the word is
-                    # still required, or any two matching numbers would mark a judgment.
+                    # Inside a citation line الطعن is not required. Models copy the court's
+                    # own reference format straight out of the judgment, and the lookbehind
+                    # window then misses الطعن by a character or two, throwing away a
+                    # citation the model made correctly. In ordinary prose the word is still
+                    # required, or any two matching numbers would count as a judgment.
                     if year in window and (in_citation_line or "الطعن" in window):
                         cited = True
                         break
@@ -906,13 +882,12 @@ def source_url(src):
 
 def sources_to_elements(sources):
     labels = []
-    # Legislation always precedes judgments in the numbered list, per the client's
-    # request that the law itself -- not case law applying it -- comes first. Stable
-    # sort: relative order within each group (retrieval order) is otherwise preserved.
-    # NOT re-sorted and NOT renumbered. The previous version sorted cited sources
-    # legislation-first and numbered them 1..n, so the panel's [1] was not necessarily the
-    # model's [1] -- the two numbering schemes silently disagreed. Numbering now comes from
-    # source_id, which is retrieval order and the same number the model was shown.
+    # Legislation is listed before judgments: a lawyer wants the governing text before the
+    # cases applying it. The sort is stable, so relative order inside each group survives.
+    #
+    # The numbers come from source_id, which is retrieval order and the same number the
+    # model was shown. An earlier version renumbered the panel after sorting, so the
+    # panel's [1] and the model's [1] could point at different passages.
     cited = [s for s in sources if s.get("cited")]
     uncited = [s for s in sources if not s.get("cited")]
 
@@ -939,33 +914,29 @@ def sources_to_elements(sources):
         labels.extend(f"[{src.get('source_id')}]" for src in cited)
         sections.append("## المصادر المستشهد بها في الاجابة\n\n" + "\n".join(cited_blocks))
 
-    # Retrieved-but-uncited sources are DISPLAY-suppressed, not discarded. `uncited` is
-    # still computed above and every one of those chunks is still retrieved, still sent to
-    # the model, and still written to the session log with cited=False -- only the sidebar
-    # section that listed them is gone, so the panel shows the cited sources alone.
+    # Retrieved but uncited sources are hidden from the panel, not discarded. They are
+    # still fetched, still sent to the model, and still written to the log with
+    # cited=False. Only the sidebar section listing them is gone.
     #
-    # The cost of hiding them, worth remembering when debugging: an empty panel no longer
-    # distinguishes "the model used nothing" from "the code failed to match what it used".
-    # The log still tells them apart -- compare n_cited against len(sources) there.
+    # Worth knowing when debugging: an empty panel no longer separates "the model used
+    # nothing" from "the matching code failed". The log still tells them apart -- compare
+    # n_cited against the number of sources there.
 
     elements = []
     if sections:
-        # NOT named "المصادر": Chainlit auto-links any exact occurrence of an element's
-        # `name` found in the message text, turning it into a jump-to-panel link. The
-        # model's own "المصادر_المستخدمة:" marker and our own content_suffix below both
-        # contain that bare word, so naming the element "المصادر" split them into broken
-        # mid-word links (visible in production: "[المصادر](#)_المستخدمة:"). This name
-        # does not occur verbatim in either string, so nothing gets swallowed.
+        # Not named "المصادر". Chainlit turns any exact occurrence of an element's name in
+        # the message text into a link to that element, and the bare word appears inside
+        # "المصادر_المستخدمة:", so that name produced broken mid-word links in production.
+        # This longer name appears in neither string.
         elements.append(cl.Text(
             name="قائمة المصادر",
             content="\n\n".join(sections),
             display="side",
         ))
 
-    # Deliberately contains "قائمة المصادر" verbatim -- Chainlit auto-links any exact
-    # occurrence of an element's name to that element, so this is what makes the line
-    # clickable and opens the side panel. The model's own "المصادر_المستخدمة:" marker
-    # does not contain this longer phrase, so it is not affected by the same mechanism.
+    # This phrase appears verbatim in the element name above, which is what makes the line
+    # clickable: Chainlit matches the two and links them. The model's own
+    # "المصادر_المستخدمة:" marker does not contain the longer phrase, so it is unaffected.
     content_suffix = ("\n\n**قائمة المصادر المستشهد بها في الاجابة:** " + " ".join(labels)) if labels else ""
     return elements, content_suffix
 
@@ -997,50 +968,43 @@ def build_export_text(messages):
     return "\n".join(lines)
 
 
-# ---------------------------------------------------------------------------
-# Attachments: text extraction.
+# Attachments: getting text out of an uploaded file.
 #
-# Two separate features, both driven off an attached file:
-#   REVIEW_COMMAND_ID -- document + corpus retrieval ("does this comply?")
-#   DOCQA_COMMAND_ID  -- document only, no corpus ("what does this say?")
+# Two features share this path:
+#   REVIEW_COMMAND_ID  the document plus retrieved law ("does this comply?")
+#   DOCQA_COMMAND_ID   the document alone, no corpus ("what does this say?")
 #
-# OCR is deliberately NOT attempted. Tesseract (both `ara` and tessdata_best)
-# systematically corrupts Arabic-Indic numerals -- ٢٥ read as "79", 2002 as
-# "3007" -- which in a legal document silently changes article numbers, dates
-# and amounts. A scanned file is rejected with an explanation instead.
-# ---------------------------------------------------------------------------
+# There is no OCR. Tesseract corrupts Arabic-Indic numerals in both `ara` and
+# tessdata_best -- ٢٥ comes back as "79", 2002 as "3007" -- and in a legal document that
+# silently rewrites article numbers, dates and amounts. Scanned files are refused with an
+# explanation instead of being read badly.
 
 REVIEW_COMMAND_ID = "مراجعة مقابل القانون"
 DOCQA_COMMAND_ID = "أسئلة عن المستند"
 
-# Every question after the first is a follow-up by default: the app consults the last k
-# exchanges and rewrites the question before searching (see the retrieval step below).
-# This command lets the user override that for one question without touching مسح المحادثة
-# -- memory is NOT cleared, so earlier context is still there and still exportable; this
-# question just does not consult it. Deliberately does not clear memory, so it is not a
-# substitute for مسح المحادثة -- that button erases accumulated context, this one skips it
-# once.
+# By default every question after the first is treated as a follow-up: the app reads the
+# recent exchanges and rewrites the question before searching. This command skips that for
+# one question. It erases nothing -- the history is still there and still exportable, and
+# the next question sees it again. مسح المحادثة is the one that clears.
 FRESH_COMMAND_ID = "سؤال جديد"
 
-# Moved out of the welcome message's action buttons and into the composer toolbar, next
-# to بحث and the attachment icon, at the client's request.
+# Lives in the composer toolbar, next to بحث and the attachment icon.
 #
-# Chainlit commands are message *modifiers*, not one-shot buttons -- CommandDict has no
-# "fire on click" flag. What makes this work anyway: the composer leaves its send button
-# enabled when a command is selected with no text, and dispatches a command-only message
-# (verified live against this app, not assumed). So these are handled ahead of the
-# empty-query guard in on_message, and each runs on its own with nothing typed.
+# Chainlit commands are message modifiers rather than buttons; there is no "fire on click"
+# option. What makes a button out of one: the composer keeps send enabled when a command is
+# selected with no text, and sends a command-only message. These are therefore handled
+# ahead of the empty-query guard in on_message, each running on its own with nothing typed.
 CLEAR_COMMAND_ID = "مسح المحادثة"
 SOURCES_COMMAND_ID = "عرض كل المصادر"
 EXPORT_COMMAND_ID = "تصدير المحادثة"
 
-# Roughly 11k tokens of Arabic at the measured 3.50 chars/token. Leaves room for
-# the retrieved corpus context and the answer inside a typical 32k window.
+# About 11k tokens of Arabic at the measured 3.50 characters per token, which leaves room
+# for the retrieved law and the answer inside a typical 32k window.
 ATTACH_MAX_CHARS = 40000
 SUPPORTED_ATTACH_EXT = (".pdf", ".docx", ".txt", ".md")
 
-# Bidi controls and ZWNJ. During the corpus build these caused a law to be matched
-# to the wrong decree number, so they are stripped here too.
+# Bidi controls and zero-width non-joiners. These matched a law to the wrong decree number
+# during the corpus build, so they are stripped out of uploads too.
 _BIDI_MARKS = re.compile(r"[‌-‏‪-‮⁦-⁩]")
 _LETTER = re.compile(r"[^\W\d_]", re.UNICODE)
 
@@ -1068,9 +1032,10 @@ def _extraction_quality(text):
     return single / len(tokens), word_like / len(tokens)
 
 
-# Measured across the project's own sample documents. Readable files scored 0-8%
-# single-char and 76-96% word-like; the two broken ones scored 86%/24% and 14%/43%.
-# The thresholds sit in the gap, well clear of both groups.
+# Thresholds for spotting a file whose text came out unreadable. Measured on this
+# project's own sample documents: readable files scored 0-8% single characters and 76-96%
+# word-like runs, while the two broken ones scored 86%/24% and 14%/43%. These sit in the
+# gap between the two groups.
 MAX_SINGLE_CHAR_RATIO = 0.30
 MIN_WORD_LIKE_RATIO = 0.55
 
@@ -1087,8 +1052,8 @@ def _extract_pdf(path):
         doc.close()
 
     text = "\n".join(pages).strip()
-    # A born-digital page carries hundreds of characters; a scanned image carries
-    # almost none. Below this the file has no usable text layer.
+        # A born-digital page carries hundreds of characters; a scan carries almost none.
+        # Below this there is no usable text layer to work with.
     if n_pages and len(text) < 50 * n_pages:
         return "", (
             f"الملف يبدو مصوراً (scanned) ولا يحتوي على نص قابل للاستخراج "
@@ -1171,9 +1136,9 @@ def extract_document_text(path, name):
 
     text = _normalize_extracted(text)
 
-    # A PDF with a broken encoding map still yields "text" -- just unreadable text.
-    # Passing it to the model would produce a confident answer about a document nobody
-    # can actually read, which in a legal setting is worse than refusing.
+    # A PDF with a broken encoding map still yields "text", just unreadable text. Handing
+    # that to the model produces a confident answer about a document nobody can read,
+    # which in a legal setting is worse than refusing.
     single_ratio, word_ratio = _extraction_quality(text)
     if single_ratio > MAX_SINGLE_CHAR_RATIO or word_ratio < MIN_WORD_LIKE_RATIO:
         return "", (
@@ -1191,10 +1156,10 @@ def extract_document_text(path, name):
 
 SEARCH_COMMAND_ID = "بحث"
 
-# The two modes are exposed as Chat Profiles -- Chainlit's native equivalent of tabs -- so
-# Search is a visible, first-class destination instead of a slash-command hidden in the
-# composer. Each profile also shows only the settings that actually affect it (the
-# "عدد النتائج" slider applies to Search only, which previously caused confusion).
+# The two modes are Chat Profiles, Chainlit's version of tabs, so Search is a visible
+# destination rather than a slash command buried in the composer. Each profile shows only
+# the settings that affect it -- عدد النتائج applies to Search alone, which confused people
+# when it appeared in both.
 PROFILE_CHAT = "المحادثة القانونية"
 PROFILE_SEARCH = "البحث المباشر"
 
@@ -1249,9 +1214,9 @@ async def start():
             items={"التشريعات": "lloc", "السوابق القضائية": "sjc", "المحكمة الدستورية": "ccb"},
         ),
     ]
-    # عدد النتائج is shown in BOTH profiles. Search is reachable from Chat too, via the
-    # بحث command -- and while this slider was Search-profile-only, a search run that way
-    # was permanently stuck at k_value=10 with no way to change it.
+        # Shown in both profiles. Search is reachable from Chat through the بحث command,
+        # and while this slider was Search-only, a search started that way was stuck at ten
+        # results with no way to change it.
     widgets.append(Slider(id="k_value", label="عدد النتائج", initial=10, min=1, max=30, step=1))
     if not is_search:
         widgets.append(Select(
@@ -1265,20 +1230,16 @@ async def start():
     cl.user_session.set("k_value", 10)
     cl.user_session.set("llm_provider", DEFAULT_LLM_PROVIDER)
 
-    # The three toolbar actions below are registered in BOTH modes -- Search has a
-    # transcript to clear and export just as Chat does, which is why they were on the
-    # welcome message in both. عرض كل المصادر stays Chat-only: Search prints its sources
-    # inline in every result, so there is no separate set to collect.
-    #
-    # The two attachment features are deliberately NOT here any more -- they are offered
-    # as buttons the moment a file is read (build_document_actions).
-    #
-    # None of these are persistent: each is a one-off action that should clear itself
-    # after firing rather than stay armed and re-fire on the next question.
+        # These three are registered in both modes: Search has a transcript to clear and
+        # export just as Chat does. عرض كل المصادر stays Chat-only, because Search already
+        # prints its sources inline with every result.
+        #
+        # None of them persist. Each fires once and clears itself rather than staying armed
+        # for the next question.
     toolbar_commands = []
     if not is_search:
-        # The slash-command stays available in Chat mode as a shortcut, but Search now has
-        # its own profile so it no longer has to be discovered through the "/" menu.
+            # The slash command still works in Chat as a shortcut, but Search has its own
+            # profile now, so nobody has to find it in the "/" menu.
         toolbar_commands += [
             {
                 "id": SEARCH_COMMAND_ID,
@@ -1330,8 +1291,8 @@ async def start():
 
     key_error = None
     if is_search:
-        # Search never calls an LLM, so skip building the chain entirely: faster startup and
-        # no spurious "API key missing" warning in a mode that does not need one.
+            # Search never calls a model, so the chain is not built at all: faster startup,
+            # and no "API key missing" warning in a mode that needs no key.
         cl.user_session.set("qa_chain", None)
     else:
         try:
@@ -1361,8 +1322,8 @@ async def start():
             f"\n\n⚠️ {key_error} — المحادثة مع النموذج معطّلة حالياً، "
             "لكن **" + PROFILE_SEARCH + "** يعمل بدون الحاجة لمفتاح API."
         )
-    # No action buttons here any more: مسح المحادثة / عرض كل المصادر / تصدير المحادثة now
-    # live in the composer toolbar, so the welcome message is text only.
+        # Text only. مسح المحادثة, عرض كل المصادر and تصدير المحادثة live in the composer
+        # toolbar now rather than as buttons here.
     await cl.Message(content=welcome).send()
 
 
@@ -1409,8 +1370,8 @@ def _apply_source_guarantee(ranked, k_value, selected_sources):
     if not legislation or not judgments:
         return ranked[:k_value]
 
-    # Reserve a floor for each type rather than just one slot, so the scarcer type is
-    # actually usable and not a single token result.
+        # Reserve a share of the results for each type rather than a single slot, so the
+        # scarcer type comes back usable instead of as one token result.
     reserve = max(1, k_value // 5)
     picked = legislation[: min(len(legislation), reserve)] + judgments[: min(len(judgments), reserve)]
     picked_ids = {id(d) for d in picked}
@@ -1439,21 +1400,21 @@ async def run_search(query: str):
         await cl.Message(content=f"تعذر الوصول لقاعدة البيانات القانونية: {e}").send()
         return 0
 
-    # --- Change 2: fetch pool scales with k_value instead of a flat SEARCH_FETCH_POOL. ---
+        # The pool scales with what was asked for, inside the floor and cap set above.
     fetch_pool = min(max(SEARCH_FETCH_POOL, k_value * SEARCH_FETCH_MULTIPLIER), SEARCH_FETCH_POOL_MAX)
 
     def _search():
         scored = vectordb.similarity_search_with_score(
             query, k=fetch_pool, filter=build_source_filter(selected_sources)
         )
-        # --- Change 3: looser, Search-specific threshold (see module docstring). ---
+            # Browsing uses the looser of the two cutoffs.
         return [doc for doc, score in scored if score <= SEARCH_SCORE_THRESHOLD_BROWSE]
 
     raw_results = await cl.make_async(_search)()
 
-    # --- Change 1: dedupe by (source, doc_id, article_no), not (source, doc_id) -- keeps
-    # genuinely different articles of the same law as separate results, while still merging
-    # true fragment-duplicates of the same article. ---
+        # Deduplicate on (source, doc_id, article_no). Including the article number keeps
+        # two different articles of the same law apart, while still merging repeated
+        # fragments of the same article.
     seen = set()
     ranked = []
     for doc in raw_results:
@@ -1467,17 +1428,17 @@ async def run_search(query: str):
         seen.add(dedupe_key)
         ranked.append(doc)
 
-    # NOTE: the truncation to k_value deliberately no longer happens in the loop above.
-    # It has to come AFTER the source guarantee, or the guarantee would only ever see the
-    # top k_value results -- which is exactly the set that was missing a whole source type.
+        # Truncation to k_value happens after the source guarantee, not before. Cutting
+        # first would leave the guarantee looking only at the top k_value results -- which
+        # is exactly the set that was missing a whole document type.
     results = _apply_source_guarantee(ranked, k_value, selected_sources)
 
     if not results:
         await cl.Message(content="لا توجد نتائج مطابقة.").send()
         return 0
 
-    # Group legislation first, then judgments -- a lawyer wants the governing text before
-    # the cases applying it. Relevance order is preserved WITHIN each group.
+        # Legislation first, then judgments: the governing text before the cases applying
+        # it. Relevance order is preserved inside each group.
     legislation = [d for d in results if d.metadata.get("source") == "lloc"]
     judgments = [d for d in results if d.metadata.get("source") in ("sjc", "ccb")]
     other = [d for d in results if d.metadata.get("source") not in ("lloc", "sjc", "ccb")]
@@ -1486,12 +1447,13 @@ async def run_search(query: str):
     lines = [f"**{len(results)} نتيجة (بحث مباشر بدون نموذج لغوي):**", ""]
     idx = 0
 
-    # --- attach each judgment to the law it applied -------------------------------
-    # There is no metadata linking a judgment to a law (verified: every sjc record has
-    # empty title/categories/article_no/section_heading), so the only available signal is
-    # the decree citation inside the judgment's own text. Laws are keyed by the
-    # (number, year) in their header, read from the retrieved laws themselves -- no corpus
-    # scan needed. A judgment citing several of the retrieved laws is listed under each.
+        # Attach each judgment to the law it applied.
+        #
+        # Nothing in the data links the two -- every sjc record has an empty title,
+        # categories, article_no and section_heading -- so the only signal is the decree
+        # number quoted in the judgment's own text. Laws are keyed by the (number, year) in
+        # their header, read off the retrieved laws themselves, so no corpus scan is
+        # needed. A judgment citing several of them is listed under each.
     law_key = {}
     for doc in legislation:
         did = doc.metadata.get("doc_id", "")
@@ -1508,9 +1470,9 @@ async def run_search(query: str):
             for did in hits:
                 cases_for.setdefault(did, []).append(doc)
         else:
-            # ~2/3 of judgments land here: they cite no decree number at all, so there is
-            # no honest way to say which law they applied. Shown in their own block rather
-            # than guessed into one.
+                # Around two thirds of judgments end up here: they quote no decree number
+                # at all, so there is no honest way to say which law they applied. They get
+                # their own block rather than a guess.
             unattached.append(doc)
 
     def render_cases(group, indent="  "):
@@ -1555,14 +1517,14 @@ async def run_search(query: str):
             lines.append("")
             for doc in docs:
                 article = doc.metadata.get("article_no", "")
-                # doc_id is part of the name so two laws' "مادة 5" cannot collide -- the
-                # name is what Chainlit matches on to make the side-panel link.
+                    # doc_id is part of the name so two laws' "مادة 5" cannot collide.
+                    # Chainlit matches on the name to build the side-panel link.
                 name = f"مادة {article} ({doc_id})" if article else f"مقطع من {doc_id}"
                 full_text = full_text_for_doc(doc)
                 snippet = full_text[:160].strip()
                 lines.append(f"- **{name}** — *{snippet}...*")
                 elements.append(cl.Text(name=name, content=full_text, display="side"))
-            # The law's own case law, immediately under it, before the next law.
+                # The law's own case law, directly beneath it, before the next law.
             related = cases_for.get(doc_id) or []
             if related:
                 lines.append("")
@@ -1596,7 +1558,7 @@ async def run_search(query: str):
             elements.append(cl.Text(name=name, content=full_text, display="side"))
 
     if legislation:
-        # Interleaved view: each law, its مواد, then the cases that applied it.
+            # Interleaved: each law, its articles, then the cases that applied it.
         render_by_law(legislation, "التشريعات")
         if unattached:
             lines.append("## سوابق قضائية أخرى ذات صلة")
@@ -1604,8 +1566,8 @@ async def run_search(query: str):
             render_cases(unattached, indent="")
             lines.append("")
     else:
-        # Judgments-only result (or a judgments-only source selection): nothing to
-        # interleave against, so they keep the plain flat listing.
+            # Judgments with no legislation to interleave against, either because the
+            # question returned none or because only judgments were selected. Flat list.
         render_flat(judgments, "السوابق القضائية")
     render_flat(other, "مصادر أخرى")
 
@@ -1636,13 +1598,13 @@ async def ingest_attachments(message):
         log_turn("attachment", filename=f.name, chars=len(text), note=note, ok=bool(text))
 
     if read_ok:
-        # Several files are concatenated under labelled headers so the model can tell
-        # them apart and name the right one in its answer.
+            # Files are concatenated under labelled headers so the model can tell them
+            # apart and name the right one in its answer.
         combined = "\n\n".join(f"=== {name} ===\n{text}" for name, text in read_ok)
         cl.user_session.set("doc_text", combined[:ATTACH_MAX_CHARS])
         cl.user_session.set("doc_name", "، ".join(name for name, _ in read_ok))
-        # A new document re-asks which mode to use, rather than silently inheriting the
-        # mode chosen for the previous one.
+            # A new document asks again which mode to use rather than inheriting the mode
+            # chosen for the last one.
         cl.user_session.set("doc_mode", None)
 
     await cl.Message(content="**الملفات المرفقة:**\n" + "\n".join(notes)).send()
@@ -1683,9 +1645,9 @@ async def answer_with_document(message, query, history, mode):
             selected_sources = cl.user_session.get("selected_sources") or list(ALL_SOURCES)
             qa_chain.retriever.filter = build_source_filter(selected_sources)
             async with cl.Step(name="جارٍ البحث في المصادر...", type="retrieval"):
-                # Retrieve against the question AND the document opening, so a bare
-                # request like "راجع هذا العقد" still pulls relevant law rather than
-                # matching on those two words alone.
+                    # Retrieve against the question and the opening of the document, so a
+                    # bare "راجع هذا العقد" still pulls relevant law instead of matching on
+                    # those two words alone.
                 retrieval_query = f"{query}\n{doc_text[:1500]}"
                 docs = await cl.make_async(qa_chain.retriever.invoke)(retrieval_query)
                 t_retrieval = round(time.time() - t_start, 2)
@@ -1768,8 +1730,8 @@ async def on_message(message: cl.Message):
 
     history = cl.user_session.get("history") or []
 
-    # The three toolbar commands are handled before the empty-query guard below, because
-    # they are sent with no text at all -- the whole message IS the command.
+    # The toolbar commands are handled before the empty-query guard below, because they
+    # arrive with no text at all: the command is the whole message.
     if message.command == CLEAR_COMMAND_ID:
         await clear_conversation()
         return
@@ -1780,23 +1742,22 @@ async def on_message(message: cl.Message):
         await export_conversation()
         return
 
-    # Attachments are ingested before anything else, so a file dropped in with no text
-    # at all is still read and confirmed rather than silently discarded.
+    # Attachments are read first, so a file dropped in with no accompanying text is still
+    # picked up and confirmed rather than silently ignored.
     had_attachment = await ingest_attachments(message)
     if not query:
         if had_attachment:
-            # The two document features are offered here as buttons rather than as
-            # commands the client has to know to pre-select -- see build_document_actions.
+            # The two document features are offered as buttons here rather than as
+            # commands the user has to know about beforehand. See build_document_actions.
             await cl.Message(
                 content="تمت قراءة المستند. ماذا تريد أن تفعل به؟",
                 actions=build_document_actions(),
             ).send()
         return
 
-    # Two ways in: the command form (kept working in case the two are ever restored to
-    # the toolbar) and doc_mode, which is what the post-upload buttons set. doc_mode is
-    # only honoured while a document is actually loaded, so it cannot silently swallow a
-    # normal legal question after the document is gone.
+    # Two ways in: the command form, kept in case the pair is ever moved back to the
+    # toolbar, and doc_mode, which is what the buttons set. doc_mode is honoured only while
+    # a document is loaded, so it cannot swallow an ordinary legal question later on.
     doc_mode = None
     if message.command == REVIEW_COMMAND_ID:
         doc_mode = "review"
@@ -1812,11 +1773,10 @@ async def on_message(message: cl.Message):
         await answer_with_document(message, query, history, doc_mode)
         return
 
-    # A file attached with no command at all defaults to review -- it is the feature
-    # that uses the corpus, and answering a legal question without the law would be the
-    # more surprising default. Only when no command was explicitly chosen -- if the user
-    # picked "سؤال جديد" while attaching a file, that explicit choice must not be
-    # silently overridden into review mode.
+    # A file attached with no command defaults to review, since that is the feature that
+    # consults the corpus, and answering a legal question without the law would be the
+    # stranger default. Only when no command was chosen: picking "سؤال جديد" while
+    # attaching a file is an explicit choice and must not be overridden.
     if had_attachment and not message.command and cl.user_session.get("mode") != "search":
         history.append({"role": "user", "content": f"[{REVIEW_COMMAND_ID}] {query}"})
         cl.user_session.set("history", history)
@@ -1863,16 +1823,16 @@ async def on_message(message: cl.Message):
     standalone = query
 
     try:
-        # Retrieval and generation are driven separately rather than through
-        # chain.invoke() so that ONLY the final answer streams. ConversationalRetrievalChain
-        # also calls the LLM to condense a follow-up question into a standalone one; streaming
-        # that would print the rewritten question into the chat.
+            # Retrieval and generation are driven by hand rather than through
+            # chain.invoke(), so that only the final answer streams.
+            # ConversationalRetrievalChain also calls the model to condense a follow-up into
+            # a standalone question, and streaming that would print the rewritten question
+            # into the chat.
         async with cl.Step(name="جارٍ البحث في المصادر...", type="retrieval") as step:
             standalone = query
-            # "سؤال جديد" skips consulting memory for retrieval on THIS question only --
-            # it does not clear it. The answer is still saved into memory afterward
-            # (below), so the next question -- without the command -- sees this turn as
-            # part of its history again. مسح المحادثة is the one that actually erases it.
+                # "سؤال جديد" skips the history for this question's retrieval only. The
+                # answer is still saved afterwards, so the next question sees this turn as
+                # context again. مسح المحادثة is the one that erases it.
             history_pairs = (
                 [] if fresh else
                 (qa_chain.memory.load_memory_variables({}).get("chat_history") or [])
@@ -1885,11 +1845,11 @@ async def on_message(message: cl.Message):
                     "🆕 تم تجاهل المحادثة السابقة عند البحث لهذا السؤال فقط، بناءً على اختيارك. "
                     "المحادثة نفسها لم تُمسح، وستُستأنف تلقائياً مع السؤال التالي."
                 )
-            # Every question after the first is rewritten into a standalone question
-            # before it searches the database, and that rewrite -- not what the user
-            # typed -- decides what is retrieved. It used to be invisible, so a bad
-            # answer caused by the rewrite pulling in an earlier topic was impossible
-            # to diagnose from the chat. Shown only when it actually differs.
+                # Every question after the first is rewritten into a standalone question
+                # before it searches, and that rewrite -- not what was typed -- decides what
+                # comes back. It used to happen invisibly, which made a bad answer caused by
+                # the rewrite dragging in an earlier topic impossible to diagnose. Shown
+                # only when it actually differs from the question.
             elif standalone.strip() != query.strip():
                 step.output = (
                     "أُعيدت صياغة سؤالك تلقائياً قبل البحث، بناءً على المحادثة السابقة. "
@@ -1906,17 +1866,17 @@ async def on_message(message: cl.Message):
         await stream_msg.send()
 
         llm = qa_chain.combine_docs_chain.llm_chain.llm
-        # Per-model prompt. This is the line that decides what the model actually sees --
-        # chat streams through llm.astream() and never calls chain.invoke(), so the prompt
-        # passed to build_qa_chain is not what generates the answer. Defaults to
-        # QA_CHAIN_PROMPT, so every model without its own entry is unaffected.
+            # This line decides what the model actually sees. Chat streams through
+            # llm.astream() and never calls chain.invoke(), so the prompt handed to
+            # build_qa_chain is not the one generating the answer. Models without their own
+            # entry fall back to QA_CHAIN_PROMPT.
         prompt_text = prompt_for(provider).format(
             context=docs_to_context(docs),
             question=query,
         )
-        # The non-streaming path used _invoke_with_retry, which retries transient upstream
-        # failures ("Service temporarily overloaded"). Streaming must retry too, otherwise a
-        # blip that used to be invisible now reaches the user as an error message.
+            # The non-streaming path retries transient upstream failures. Streaming has to
+            # retry too, or a blip that used to be invisible now reaches the user as an
+            # error message.
         for attempt in range(1, STREAM_MAX_ATTEMPTS + 1):
             try:
                 answer = ""
@@ -1941,13 +1901,13 @@ async def on_message(message: cl.Message):
     except Exception as e:
         error = str(e)[:300]
         if "rate_limit" in str(e).lower() or "429" in str(e):
-            # Two very different causes arrive as the same 429, and telling the client
-            # "you used up your quota" when the real problem is a saturated shared
-            # endpoint sends them to fix something that is not broken.
-            #   upstream_provider_shared_pool -> the FREE model's provider is full for
-            #       everyone on OpenRouter; a different key changes nothing, a different
-            #       model does. Observed on z-ai/glm-5.2:free even for a 10-token request.
-            #   otherwise -> this account's own per-minute / per-day allowance.
+                # Two unrelated problems arrive as the same 429, and telling someone they
+                # are out of quota when the real cause is a saturated shared endpoint sends
+                # them off to fix something that is not broken.
+                #   upstream_provider_shared_pool: the free model's provider is full for
+                #       everyone on OpenRouter. A different key changes nothing; a
+                #       different model does.
+                #   anything else: this account's own per-minute or per-day allowance.
             low = str(e).lower()
             if "shared_pool" in low or "upstream_429" in low:
                 answer = (
@@ -1967,8 +1927,8 @@ async def on_message(message: cl.Message):
         "chat",
         question=query,
         fresh=fresh,
-        # The query actually sent to the retriever. Differs from `question` whenever the
-        # follow-up rewriter fired, which is the usual cause of a puzzling answer.
+            # The query actually sent to the retriever. It differs from `question` whenever
+            # the follow-up rewriter fired, which is the usual cause of a puzzling answer.
         search_query=standalone if standalone.strip() != query.strip() else None,
         answer=answer,
         seconds=elapsed,
@@ -1982,8 +1942,8 @@ async def on_message(message: cl.Message):
 
     elements, content_suffix = sources_to_elements(sources)
     if stream_msg is not None:
-        # Update the message that was streamed rather than sending a second one, otherwise
-        # the answer would appear twice.
+            # Update the message that was streamed rather than sending a second one, or
+            # the answer appears twice.
         stream_msg.content = answer + content_suffix
         stream_msg.elements = elements
         await stream_msg.update()
@@ -2031,9 +1991,9 @@ async def clear_conversation():
     qa_chain = cl.user_session.get("qa_chain")
     if qa_chain is not None:
         qa_chain.memory.clear()
-    # Releases the document mode too, so this doubles as the way out of مراجعة مقابل
-    # القانون / أسئلة عن المستند. The document itself (doc_text) is deliberately kept --
-    # only the routing flag is cleared, so nothing the client uploaded is thrown away.
+    # Clears the document routing flag as well, so this doubles as the way out of
+    # مراجعة مقابل القانون and أسئلة عن المستند. The document text itself is kept -- only
+    # the routing is reset, so nothing that was uploaded is thrown away.
     cl.user_session.set("doc_mode", None)
     await cl.Message(content="تم مسح المحادثة — يمكنك البدء بسؤال جديد.").send()
 
