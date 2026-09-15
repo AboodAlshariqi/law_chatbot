@@ -117,7 +117,7 @@ Search feeature works without any key; only the chat needs a model.
 | | context window | notes |
 |---|---|---|
 | **Fanar (QCRI)** | 16k | Arabic-native, fastest (~20 s), limits are your own |
-| **Nemotron 550B** | 262k | most detailed, slowest (~56 s), free tier is shared |
+| **Nemotron 550B** | 1M | most detailed, slowest (~56 s), free tier is shared |
 | **MiniMax M3** | 1M | large context; free tier shares upstream capacity |
 
 The context windows come from each provider's own documentation, and the response times are
