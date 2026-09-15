@@ -3,7 +3,7 @@
 An Arabic legal research assistant for Bahraini law. Ask a question in Arabic and get a
 structured answer that shows the article or judgment behind every claim.
 
-Built as a Data Science capstone for **General Assembly × BIBF**.
+Built as a Data Science capstone for **General Assembly**.
 
 ---
 
