@@ -1,7 +1,7 @@
 # Data
 
-The corpus is ~2.1 GB and is not in this repository. This file explains what is needed, where
-to get it, and how to confirm it arrived intact.
+The corpus is ~2.1 GB and is not in this repository. This file explains what is needed and
+where to get it.
 
 ## What the app needs to run
 
@@ -37,26 +37,9 @@ The three JSON files are optional. Without them the chat is unaffected; البح
 
 Download from the project Google Drive folder (link supplied separately -- ask the authors).
 
-## Verify the download
-
-Google Drive reports no error when a file arrives truncated, so check before running:
-
-```bash
-python verify_chroma.py
-```
-
-It confirms the database size, all five vector files, the chunk count, and that all three
-sources are present. It prints `RESULT: usable` or names the file that failed.
-
-Expected:
-
-```
-chunks   49,782
-highest id   c049781
-sources   lloc 38,281 · sjc 11,339 · ccb 162
-```
-
-If the chunk count differs, the database is the wrong build or the download is incomplete.
+Google Drive reports no error when a file arrives truncated, so it is worth checking what
+you got. A complete `chroma_v3` holds **49,782 chunks** -- lloc 38,281, sjc 11,339, ccb 162.
+If yours differs, it is the wrong build or the download did not finish.
 
 ## Rebuilding from source
 
